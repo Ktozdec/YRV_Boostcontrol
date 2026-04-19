@@ -1,0 +1,44 @@
+*.iml
+.DS_Store
+
+# Android Studio / IntelliJ
+.idea/
+!.idea/codeStyles/
+!.idea/inspectionProfiles/
+.kotlin/
+
+# Local machine config
+local.properties
+.gradle/
+.gradle-user/
+
+# Build outputs
+build/
+app/build/
+app/release/
+captures/
+.externalNativeBuild/
+.cxx/
+out/
+
+# APK / AAB / mapping / generated release assets
+*.apk
+*.aab
+*.ap_
+*.aar
+output-metadata.json
+
+# Logs and temp files
+*.log
+*.tmp
+*.temp
+Thumbs.db
+
+# Signing keys / secrets
+*.jks
+*.keystore
+keystore.properties
+
+# OS / editor extras
+*.swp
+*.swo
