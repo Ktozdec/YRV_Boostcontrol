@@ -47,5 +47,6 @@ data class TelemetryData(
     @SerialName("w10") val w10: Float = 0.0f,
 
     val lastAck: String? = null,
-    val lastError: String? = null
+    val lastError: String? = null,
+    val telemetryUpdatedAtMillis: Long = 0L
 )

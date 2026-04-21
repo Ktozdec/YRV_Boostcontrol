@@ -61,6 +61,7 @@ import java.util.Locale
 @Composable
 fun SettingsScreen(viewModel: BoosterViewModel) {
     val data by viewModel.telemetry.collectAsStateWithLifecycle()
+    val connectionStatus by viewModel.connectionStatus.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
 
@@ -81,8 +82,12 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
     val rpmLabels = listOf("2000", "2500", "3000", "3500", "4000", "4500", "5000", "5500", "6000", "6500", "7000")
 
     val mapDraft = remember { List(4) { mutableStateListOf(*Array(11) { 0f }) } }
+    val mapLoaded = remember { List(4) { mutableStateListOf(*Array(11) { 0f }) } }
+    val loadedTabs = remember { mutableStateListOf(false, false, false, false) }
+    val dirtyTabs = remember { mutableStateListOf(false, false, false, false) }
     var isInitialized by remember { mutableStateOf(false) }
     var showOtaDialog by remember { mutableStateOf(false) }
+    val hasMapChanges = dirtyTabs.any { it }
 
     LaunchedEffect(data.targetBoost) {
         if (!isInitialized && data.targetBoost != 0f) {
@@ -108,17 +113,27 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
     LaunchedEffect(data) {
         val t = data.tab
         if (t in 0..3) {
-            mapDraft[t][0] = data.w0
-            mapDraft[t][1] = data.w1
-            mapDraft[t][2] = data.w2
-            mapDraft[t][3] = data.w3
-            mapDraft[t][4] = data.w4
-            mapDraft[t][5] = data.w5
-            mapDraft[t][6] = data.w6
-            mapDraft[t][7] = data.w7
-            mapDraft[t][8] = data.w8
-            mapDraft[t][9] = data.w9
-            mapDraft[t][10] = data.w10
+            val incomingValues = listOf(
+                data.w0, data.w1, data.w2, data.w3, data.w4, data.w5,
+                data.w6, data.w7, data.w8, data.w9, data.w10
+            )
+            incomingValues.forEachIndexed { index, value ->
+                mapLoaded[t][index] = value
+                if (!dirtyTabs[t]) {
+                    mapDraft[t][index] = value
+                }
+            }
+            loadedTabs[t] = true
+        }
+    }
+
+    LaunchedEffect(connectionStatus) {
+        if (connectionStatus == "Подключено") {
+            repeat(4) { tab ->
+                viewModel.sendCommand("TAB:$tab")
+                delay(180)
+            }
+            viewModel.sendCommand("GET:SETTINGS")
         }
     }
 
@@ -160,6 +175,9 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                 rpmLabels.forEachIndexed { rIndex, rpmStr ->
                     TuneRow("$rpmStr RPM", mapDraft[selectedTps][rIndex], 1.0f, "%.1f", 0f, 85f) {
                         mapDraft[selectedTps][rIndex] = it
+                        dirtyTabs[selectedTps] = (0..10).any { index ->
+                            mapDraft[selectedTps][index] != mapLoaded[selectedTps][index]
+                        }
                     }
                 }
             }
@@ -202,51 +220,99 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         }
 
         item {
-            val isDataLoaded = isInitialized && data.targetBoost != 0f
+            val isSettingsLoaded = isInitialized && data.targetBoost != 0f
             Button(
                 onClick = {
-                    if (!isDataLoaded) {
-                        Toast.makeText(context, "Дождитесь загрузки данных из ЭБУ!", Toast.LENGTH_SHORT).show()
+                    if (!isSettingsLoaded) {
+                        Toast.makeText(context, "Дождитесь загрузки основных настроек из ЭБУ", Toast.LENGTH_SHORT).show()
                         return@Button
                     }
                     scope.launch {
                         viewModel.sendCommand("SET:tB:${fmt(clampValue(draftTb, 0.3f, 1.5f), "%.2f")}")
+                        delay(90)
                         viewModel.sendCommand("SET:kP:${fmt(clampValue(draftKp, 0f, 200f), "%.1f")}")
+                        delay(90)
                         viewModel.sendCommand("SET:kI:${fmt(clampValue(draftKi, 0f, 200f), "%.1f")}")
+                        delay(90)
                         viewModel.sendCommand("SET:kD:${fmt(clampValue(draftKd, 0f, 50f), "%.1f")}")
+                        delay(90)
                         viewModel.sendCommand("SET:lA:${fmt(clampValue(draftLa, 0.005f, 0.15f), "%.3f")}")
+                        delay(90)
                         viewModel.sendCommand("SET:oP:${fmt(clampValue(draftOp, 0.1f, 4.5f), "%.2f")}")
+                        delay(90)
                         viewModel.sendCommand("SET:sP:${fmt(clampValue(draftSp, 0.1f, 2.0f), "%.2f")}")
+                        delay(90)
                         viewModel.sendCommand("SET:oV:${fmt(clampValue(draftOv, 0.1f, 3.5f), "%.2f")}")
+                        delay(90)
                         viewModel.sendCommand("SET:pR:${fmt(clampValue(draftPr, 0.5f, 8.0f), "%.1f")}")
+                        delay(90)
                         viewModel.sendCommand("SET:vP:${fmt(clampValue(draftVp, 1.0f, 40.0f), "%.2f")}")
-
-                        for (t in 0..3) {
-                            for (r in 0..10) {
-                                viewModel.sendCommand("SET:M_${t}_${r}:${fmt(clampValue(mapDraft[t][r], 0f, 85f), "%.1f")}")
-                                delay(20)
-                            }
-                        }
-
-                        viewModel.sendCommand("SAVE_MAP")
+                        delay(120)
                         viewModel.sendCommand("SAVE")
-                        Toast.makeText(context, "Матрица и настройки отправлены!", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Настройки сохранены без карты", Toast.LENGTH_SHORT).show()
                     }
                 },
                 modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(64.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = if (isDataLoaded) StatusGreen else Color.DarkGray)
+                colors = ButtonDefaults.buttonColors(containerColor = if (isSettingsLoaded) StatusGreen else Color.DarkGray)
             ) {
                 Text(
-                    "СОХРАНИТЬ В ЭБУ",
+                    "СОХРАНИТЬ",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
-                    color = if (isDataLoaded) NeonWhite else TextGray
+                    color = if (isSettingsLoaded) NeonWhite else TextGray
                 )
+            }
+        }
+
+        if (hasMapChanges) {
+            item {
+                val allTabsLoaded = loadedTabs.all { it }
+                Button(
+                    onClick = {
+                        if (!allTabsLoaded) {
+                            Toast.makeText(context, "Дождитесь загрузки всех 4 рядов карты из ЭБУ", Toast.LENGTH_SHORT).show()
+                            return@Button
+                        }
+                        scope.launch {
+                            for (t in 0..3) {
+                                for (r in 0..10) {
+                                    viewModel.sendCommand("SET:M_${t}_${r}:${fmt(clampValue(mapDraft[t][r], 0f, 85f), "%.1f")}")
+                                    delay(90)
+                                }
+                            }
+                            viewModel.sendCommand("SAVE_MAP")
+                            (0..3).forEach { tab ->
+                                (0..10).forEach { index ->
+                                    mapLoaded[tab][index] = mapDraft[tab][index]
+                                }
+                                dirtyTabs[tab] = false
+                            }
+                            Toast.makeText(context, "Карта сохранена в ЭБУ", Toast.LENGTH_SHORT).show()
+                        }
+                    },
+                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp).height(56.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = if (allTabsLoaded) BoostBlue else Color.DarkGray)
+                ) {
+                    Text(
+                        "SAVE MAP",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = if (allTabsLoaded) NeonWhite else TextGray
+                    )
+                }
             }
         }
 
         item {
             SettingsCard(title = "Сервисные функции") {
+                val allTabsLoaded = loadedTabs.all { it }
+                Text(
+                    if (allTabsLoaded) "Карта загружена полностью" else "Карта загружается: ${loadedTabs.count { it }}/4",
+                    color = if (allTabsLoaded) StatusGreen else Color(0xFFFFC107),
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Spacer(Modifier.height(12.dp))
                 Text("ТЕСТ СОЛЕНОИДА: ${testDutySlider.toInt()}%", fontWeight = FontWeight.Bold, color = NeonWhite)
                 Slider(
                     value = testDutySlider,

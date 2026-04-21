@@ -18,6 +18,22 @@
 #define BLE_NOTIFY_INTERVAL_MS 125
 #define SETTINGS_RESEND_INTERVAL_MS 60
 
+constexpr uint8_t ADS1115_I2C_ADDR = 0x48;
+constexpr float ADS1115_MULTIPLIER_6V144 = 0.0001875f;
+constexpr uint16_t ADS1115_CFG_OS_SINGLE = 0x8000;
+constexpr uint16_t ADS1115_CFG_PGA_6V144 = 0x0000;
+constexpr uint16_t ADS1115_CFG_MODE_SINGLE = 0x0100;
+constexpr uint16_t ADS1115_CFG_DR_860 = 0x00E0;
+constexpr uint16_t ADS1115_CFG_COMP_DISABLE = 0x0003;
+constexpr uint16_t ADS1115_CFG_BASE =
+    ADS1115_CFG_OS_SINGLE |
+    ADS1115_CFG_PGA_6V144 |
+    ADS1115_CFG_MODE_SINGLE |
+    ADS1115_CFG_DR_860 |
+    ADS1115_CFG_COMP_DISABLE;
+constexpr float SOFT_LIMP_BOOST_BAR = 1.05f;
+constexpr float HARD_LIMP_BOOST_BAR = 1.15f;
+
 const char *ssid = "YRV_Boost_Pro";
 const char *password = "";
 
@@ -29,6 +45,7 @@ SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t mapMutex;
 SemaphoreHandle_t configMutex;
 SemaphoreHandle_t bleMutex;
+TaskHandle_t storageTaskHandle = nullptr;
 
 const int rpmPin = 18;
 const int vssPin = 19;
@@ -88,6 +105,9 @@ volatile bool settingsNeedsSaving = false;
 volatile bool sendSettingsRequested = false;
 volatile bool odometerNeedsSaving = false;
 volatile bool otaModeEnabled = false;
+volatile bool forceMapSaveRequested = false;
+volatile bool forceSettingsSaveRequested = false;
+volatile bool forceOdometerSaveRequested = false;
 
 enum RebootRequest : uint8_t {
     REBOOT_NONE = 0,
@@ -167,6 +187,21 @@ bool takeMutex(SemaphoreHandle_t mutex, TickType_t timeout = pdMS_TO_TICKS(100))
     return mutex != nullptr && xSemaphoreTake(mutex, timeout) == pdTRUE;
 }
 
+RuntimeConfig snapshotConfig() {
+    RuntimeConfig localCfg = cfg;
+    if (takeMutex(configMutex, pdMS_TO_TICKS(20))) {
+        localCfg = cfg;
+        xSemaphoreGive(configMutex);
+    }
+    return localCfg;
+}
+
+void notifyStorageTask() {
+    if (storageTaskHandle != nullptr) {
+        xTaskNotifyGive(storageTaskHandle);
+    }
+}
+
 void calcWheelSizeLocked() {
     float diameterMm = (cfg.tireR * 25.4f) + 2.0f * (cfg.tireW * (cfg.tireA / 100.0f));
     cfg.wheelSizeM = (diameterMm * PI) / 1000.0f;
@@ -201,6 +236,22 @@ void initDefaultMapLocked() {
             cellSamples[t][r] = 0;
         }
     }
+}
+
+bool isMapPlausibleLocked() {
+    int populatedCells = 0;
+    float maxValue = 0.0f;
+
+    for (int t = 0; t < NUM_TPS_BINS; t++) {
+        for (int r = 0; r < NUM_RPM_BINS; r++) {
+            float cell = dutyMap2D[t][r];
+            if (!isFiniteFloat(cell)) return false;
+            if (cell > 1.0f) populatedCells++;
+            if (cell > maxValue) maxValue = cell;
+        }
+    }
+
+    return populatedCells >= 8 && maxValue >= 15.0f;
 }
 
 void sendBleText(const char *text) {
@@ -266,6 +317,13 @@ void loadMap() {
         prefs.getBytes("samples2D", cellSamples, samplesSize);
     } else {
         memset(cellSamples, 0, samplesSize);
+    }
+
+    if (!isMapPlausibleLocked()) {
+        initDefaultMapLocked();
+        prefs.putBytes("map2D", dutyMap2D, mapSize);
+        prefs.putBytes("conf2D", confidence, confidenceSize);
+        prefs.putBytes("samples2D", cellSamples, samplesSize);
     }
 
     sanitizeMapProfileLocked();
@@ -569,12 +627,18 @@ class MyCallbacks : public BLECharacteristicCallbacks {
             settingsNeedsSaving = true;
             mapNeedsSaving = true;
             odometerNeedsSaving = true;
+            forceMapSaveRequested = true;
+            forceSettingsSaveRequested = true;
+            forceOdometerSaveRequested = true;
+            notifyStorageTask();
             sendBleAck("SAVE");
             return;
         }
 
         if (msg == "SAVE_MAP") {
             mapNeedsSaving = true;
+            forceMapSaveRequested = true;
+            notifyStorageTask();
             sendBleAck("SAVE_MAP");
             return;
         }
@@ -655,11 +719,12 @@ void initPCNT() {
 }
 
 int16_t safeReadADS1115(uint8_t channel, uint32_t timeoutMs = 10) {
-    uint16_t config = 0x8583;
-    config &= ~0x7000;
+    // Keep ADC full-scale and software multiplier in sync:
+    // PGA = +/- 6.144V  -> 0.1875 mV/LSB
+    uint16_t config = ADS1115_CFG_BASE;
     config |= ((4 + channel) << 12);
 
-    Wire.beginTransmission(0x48);
+    Wire.beginTransmission(ADS1115_I2C_ADDR);
     Wire.write(1);
     Wire.write(static_cast<uint8_t>(config >> 8));
     Wire.write(static_cast<uint8_t>(config & 0xFF));
@@ -667,10 +732,10 @@ int16_t safeReadADS1115(uint8_t channel, uint32_t timeoutMs = 10) {
 
     uint32_t start = millis();
     while (millis() - start < timeoutMs) {
-        Wire.beginTransmission(0x48);
+        Wire.beginTransmission(ADS1115_I2C_ADDR);
         Wire.write(1);
         if (Wire.endTransmission() != 0) break;
-        Wire.requestFrom(static_cast<uint8_t>(0x48), static_cast<uint8_t>(2));
+        Wire.requestFrom(ADS1115_I2C_ADDR, static_cast<uint8_t>(2));
         if (Wire.available() == 2) {
             uint16_t status = (Wire.read() << 8) | Wire.read();
             if ((status & 0x8000) != 0) break;
@@ -678,10 +743,10 @@ int16_t safeReadADS1115(uint8_t channel, uint32_t timeoutMs = 10) {
         vTaskDelay(pdMS_TO_TICKS(1));
     }
 
-    Wire.beginTransmission(0x48);
+    Wire.beginTransmission(ADS1115_I2C_ADDR);
     Wire.write(0);
     if (Wire.endTransmission() != 0) return INT16_MIN;
-    Wire.requestFrom(static_cast<uint8_t>(0x48), static_cast<uint8_t>(2));
+    Wire.requestFrom(ADS1115_I2C_ADDR, static_cast<uint8_t>(2));
     if (Wire.available() == 2) {
         return static_cast<int16_t>((Wire.read() << 8) | Wire.read());
     }
@@ -691,9 +756,9 @@ int16_t safeReadADS1115(uint8_t channel, uint32_t timeoutMs = 10) {
 void updateSafety(const SensorData &d) {
     if (d.rawPIM < 0.1f || d.rawPIM > 4.9f || d.rawVTA < 0.1f || d.rawVTA > 4.9f) {
         systemMode = HARD_LIMP;
-    } else if (isnan(d.boost) || d.boost > 1.5f || (d.rpm < 300.0f && d.tps > 5.0f)) {
+    } else if (isnan(d.boost) || d.boost > HARD_LIMP_BOOST_BAR || (d.rpm < 300.0f && d.tps > 5.0f)) {
         systemMode = HARD_LIMP;
-    } else if (d.boost > 1.2f) {
+    } else if (d.boost > SOFT_LIMP_BOOST_BAR) {
         systemMode = SOFT_LIMP;
     } else {
         systemMode = NORMAL;
@@ -706,21 +771,16 @@ void TaskSensors(void *pvParameters) {
     unsigned long lastSpdCalcMs = millis();
     float rpmHist[3] = {0, 0, 0};
     float smoothedSpeed = 0.0f;
-    const float ADS1115_MULTIPLIER = 0.0001875f;
 
     for (;;) {
-        RuntimeConfig localCfg;
-        if (takeMutex(configMutex, pdMS_TO_TICKS(20))) {
-            localCfg = cfg;
-            xSemaphoreGive(configMutex);
-        }
+        RuntimeConfig localCfg = snapshotConfig();
 
         unsigned long nowMs = millis();
         int16_t r0 = safeReadADS1115(0, 10);
         int16_t r1 = safeReadADS1115(1, 10);
 
-        float rawPIM = (r0 == INT16_MIN) ? 0.0f : (r0 * ADS1115_MULTIPLIER);
-        float rawVTA = (r1 == INT16_MIN) ? 0.0f : (r1 * ADS1115_MULTIPLIER);
+        float rawPIM = (r0 == INT16_MIN) ? 0.0f : (r0 * ADS1115_MULTIPLIER_6V144);
+        float rawVTA = (r1 == INT16_MIN) ? 0.0f : (r1 * ADS1115_MULTIPLIER_6V144);
 
         float boostRaw = constrainFloat((rawPIM - localCfg.offsetPIM) * localCfg.scalePIM, -1.0f, 2.0f);
         float tpsSpan = max(0.3f, 3.71f - localCfg.offsetVTA);
@@ -791,11 +851,7 @@ void TaskControl(void *pvParameters) {
     SensorData d = {};
 
     for (;;) {
-        RuntimeConfig localCfg;
-        if (takeMutex(configMutex, pdMS_TO_TICKS(20))) {
-            localCfg = cfg;
-            xSemaphoreGive(configMutex);
-        }
+        RuntimeConfig localCfg = snapshotConfig();
         if (takeMutex(dataMutex, pdMS_TO_TICKS(40))) {
             d = sensors;
             xSemaphoreGive(dataMutex);
@@ -914,11 +970,7 @@ void TaskTelemetry(void *pvParameters) {
 
         if (deviceConnected && millis() - lastNotifyMs >= BLE_NOTIFY_INTERVAL_MS) {
             if (sendSettingsRequested) {
-                RuntimeConfig localCfg;
-                if (takeMutex(configMutex, pdMS_TO_TICKS(40))) {
-                    localCfg = cfg;
-                    xSemaphoreGive(configMutex);
-                }
+                RuntimeConfig localCfg = snapshotConfig();
 
                 snprintf(bleBuffer, sizeof(bleBuffer),
                     "{\"S\":1,\"pR\":%.1f,\"oP\":%.2f,\"sP\":%.2f,\"oV\":%.2f,\"tB\":%.2f,\"kP\":%.1f,\"kI\":%.1f,\"kD\":%.1f,\"tW\":%d,\"tA\":%d,\"tR\":%d,\"eH\":%.2f,\"vP\":%.2f,\"lA\":%.3f}\n",
@@ -961,6 +1013,7 @@ void TaskTelemetry(void *pvParameters) {
 
 void TaskOdometerAndStorage(void *pvParameters) {
     (void)pvParameters;
+    storageTaskHandle = xTaskGetCurrentTaskHandle();
     esp_task_wdt_add(nullptr);
     double lastSavedKm = totalDistanceKm;
     double lastSavedHours = stationaryEngineHours;
@@ -974,11 +1027,7 @@ void TaskOdometerAndStorage(void *pvParameters) {
         pendingVssPulses = 0;
         portEXIT_CRITICAL(&vssMux);
 
-        RuntimeConfig localCfg;
-        if (takeMutex(configMutex, pdMS_TO_TICKS(20))) {
-            localCfg = cfg;
-            xSemaphoreGive(configMutex);
-        }
+        RuntimeConfig localCfg = snapshotConfig();
 
         if (pulsesToCalc > 0) {
             double distanceStepKm = (static_cast<double>(pulsesToCalc) / static_cast<double>(localCfg.vssPulsesPerRev)) *
@@ -1019,18 +1068,20 @@ void TaskOdometerAndStorage(void *pvParameters) {
                 prefs.putInt("tR", cfg.tireR);
                 xSemaphoreGive(configMutex);
                 settingsNeedsSaving = false;
+                forceSettingsSaveRequested = false;
             }
         }
 
-        if (odometerNeedsSaving) {
+        if (odometerNeedsSaving && (forceOdometerSaveRequested || (totalDistanceKm - lastSavedKm >= 1.0) || (stationaryEngineHours - lastSavedHours >= 0.1))) {
             prefs.putDouble("oD", totalDistanceKm);
             prefs.putDouble("eH", stationaryEngineHours);
             odometerNeedsSaving = false;
+            forceOdometerSaveRequested = false;
             lastSavedKm = totalDistanceKm;
             lastSavedHours = stationaryEngineHours;
         }
 
-        if (mapNeedsSaving && (millis() - lastMapSaveMs >= 10000)) {
+        if (mapNeedsSaving && (forceMapSaveRequested || (millis() - lastMapSaveMs >= 10000))) {
             float mapSnapshot[NUM_TPS_BINS][NUM_RPM_BINS];
             float confidenceSnapshot[NUM_TPS_BINS][NUM_RPM_BINS];
             uint16_t samplesSnapshot[NUM_TPS_BINS][NUM_RPM_BINS];
@@ -1064,11 +1115,12 @@ void TaskOdometerAndStorage(void *pvParameters) {
                 prefs.putBytes("conf2D", confidenceSnapshot, sizeof(confidenceSnapshot));
                 prefs.putBytes("samples2D", samplesSnapshot, sizeof(samplesSnapshot));
             }
+            forceMapSaveRequested = false;
             lastMapSaveMs = millis();
         }
 
         esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(1000));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100));
     }
 }
 
@@ -1131,7 +1183,7 @@ void setup() {
     };
     esp_task_wdt_init(&twdt_config);
 
-    if (!prefs.begin("yrv_v5", false)) {
+    if (!prefs.begin("yrv_v4", false)) {
         Serial.println("Crit Error: NVS Init failed!");
     }
 

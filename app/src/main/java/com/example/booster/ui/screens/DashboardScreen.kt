@@ -17,16 +17,24 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.statusBarsPadding
+import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material3.Button
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -98,90 +106,160 @@ fun DashboardScreen(viewModel: BoosterViewModel) {
         }
     }
 
-    val animatedBoost by animateFloatAsState(
-        targetValue = data.boost,
-        animationSpec = tween(100, easing = LinearEasing),
-        label = "boostAnim"
-    )
     val animatedTps by animateFloatAsState(
         targetValue = data.tps.toFloat(),
         animationSpec = tween(100, easing = LinearEasing),
         label = "tpsAnim"
     )
+    var filteredBoost by remember { mutableFloatStateOf(data.boost) }
+    var filteredSpeed by remember { mutableFloatStateOf(data.speed.toFloat()) }
+    var filteredRpm by remember { mutableFloatStateOf(data.rpm.toFloat()) }
+    val scrollState = rememberScrollState()
+    val isConnected = status == "Подключено"
+    var freshnessNow by remember { mutableLongStateOf(System.currentTimeMillis()) }
     val modeLabel = when (data.mode) {
         0 -> "NORMAL"
-        1 -> "SOFT LIMP"
-        2 -> "HARD LIMP"
+        1 -> "SOFT"
+        2 -> "HARD"
         else -> "UNKNOWN"
     }
     val modeColor = when (data.mode) {
         0 -> StatusGreen
-        1 -> Color(0xFFFFC107)
-        2 -> BoostRed
+        1 -> BoostBlue
+        2 -> NeonWhite
         else -> TextGray
     }
     val textGlowStyle = TextStyle(
         shadow = Shadow(color = NeonWhite.copy(alpha = 0.5f), blurRadius = 8f),
         fontFamily = FontFamily.Monospace
     )
+    val telemetryAgeMs = if (data.telemetryUpdatedAtMillis == 0L) Long.MAX_VALUE else freshnessNow - data.telemetryUpdatedAtMillis
+    val isTelemetryStale = isConnected && telemetryAgeMs > 700L
+
+    LaunchedEffect(data.telemetryUpdatedAtMillis) {
+        if (data.telemetryUpdatedAtMillis == 0L) return@LaunchedEffect
+
+        val rawBoost = data.boost
+        val rawSpeed = data.speed.toFloat()
+        val rawRpm = data.rpm.toFloat()
+
+        filteredBoost = (rawBoost * 0.6f) + (filteredBoost * 0.4f)
+        filteredSpeed = if (rawSpeed < 2f) {
+            rawSpeed
+        } else {
+            (rawSpeed * 0.1f) + (filteredSpeed * 0.9f)
+        }
+        filteredRpm = if (rawRpm < 10f) {
+            rawRpm
+        } else {
+            (rawRpm * 0.2f) + (filteredRpm * 0.8f)
+        }
+    }
+
+    val animatedBoost by animateFloatAsState(
+        targetValue = filteredBoost,
+        animationSpec = tween(120, easing = LinearEasing),
+        label = "boostAnim"
+    )
+    val displaySpeed = filteredSpeed.toInt()
+    val displayRpm = filteredRpm.toInt()
+
+    LaunchedEffect(isConnected, data.telemetryUpdatedAtMillis) {
+        while (isConnected) {
+            freshnessNow = System.currentTimeMillis()
+            kotlinx.coroutines.delay(250)
+        }
+    }
 
     Column(
-        modifier = Modifier.fillMaxSize().background(DarkBg).padding(16.dp),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(DarkBg)
+            .verticalScroll(scrollState)
+            .statusBarsPadding()
+            .navigationBarsPadding()
+            .padding(start = 18.dp, end = 18.dp, top = 18.dp, bottom = 16.dp),
         horizontalAlignment = Alignment.CenterHorizontally
     ) {
-        Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.End) {
-            if (status != "Подключено") {
-                Button(
-                    onClick = {
-                        if (hasBlePermissions(context)) {
-                            viewModel.connect()
-                        } else {
-                            blePermissionLauncher.launch(requiredBlePermissions())
-                        }
-                    },
-                    colors = ButtonDefaults.buttonColors(containerColor = NeonWhite),
-                    modifier = Modifier.height(32.dp)
-                ) {
-                    Text(
-                        if (status == "Отключено" || status.contains("Обрыв")) "ПОДКЛЮЧИТЬСЯ" else "ПОИСК...",
-                        color = DarkBg,
-                        fontWeight = FontWeight.Black
-                    )
-                }
-            } else {
-                Text(text = "Подключено", fontSize = 14.sp, fontWeight = FontWeight.Bold, color = StatusGreen)
-            }
-        }
-
-        Spacer(modifier = Modifier.height(8.dp))
-
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("База ШИМ: ${data.baseDuty.toInt()}%", color = TextGray, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-            Text("Выход ШИМ: ${data.currentDuty.toInt()}%", color = BoostBlue, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+            Text(
+                text = "База ШИМ ${data.baseDuty.toInt()}%",
+                color = TextGray.copy(alpha = 0.58f),
+                fontSize = 14.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Text(
+                text = "ШИМ ${data.currentDuty.toInt()}%",
+                color = BoostBlue.copy(alpha = 0.72f),
+                fontSize = 14.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(modifier = Modifier.weight(1f))
+            StatusDot(
+                connected = isConnected,
+                modifier = Modifier.size(10.dp)
+            )
         }
 
-        Spacer(modifier = Modifier.height(8.dp))
+        if (isTelemetryStale) {
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "ТЕЛЕМЕТРИЯ ЗАДЕРЖАЛАСЬ",
+                color = Color(0xFFFFC107),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
 
+        Spacer(modifier = Modifier.height(14.dp))
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
-            horizontalArrangement = Arrangement.SpaceBetween,
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(14.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            Text("Режим ЭБУ: $modeLabel", color = modeColor, fontSize = 13.sp, fontWeight = FontWeight.Bold)
-            Text("Цель: ${String.format(Locale.US, "%.2f", data.targetBoost)} bar", color = TextGray, fontSize = 13.sp)
+            Text(
+                text = "Режим",
+                color = TextGray.copy(alpha = 0.58f),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Text(
+                text = modeLabel,
+                color = modeColor.copy(alpha = 0.78f),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold
+            )
+            Spacer(modifier = Modifier.widthIn(min = 6.dp))
+            Text(
+                text = "Target",
+                color = TextGray.copy(alpha = 0.58f),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.Medium
+            )
+            Text(
+                text = "${String.format(Locale.US, "%.2f", data.targetBoost)} bar",
+                color = NeonWhite.copy(alpha = 0.74f),
+                fontSize = 12.sp,
+                fontWeight = FontWeight.SemiBold
+            )
         }
 
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(28.dp))
 
-        Box(contentAlignment = Alignment.Center, modifier = Modifier.fillMaxWidth().height(260.dp)) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(260.dp)
+        ) {
             BoostCanvasGauge(boost = animatedBoost, targetBoost = data.targetBoost)
             Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.offset(y = (-10).dp)) {
                 Text(
-                    text = String.format(Locale.US, "%.2f", data.boost),
+                    text = String.format(Locale.US, "%.2f", animatedBoost),
                     fontSize = 76.sp,
                     fontWeight = FontWeight.Normal,
                     color = NeonWhite,
@@ -204,29 +282,76 @@ fun DashboardScreen(viewModel: BoosterViewModel) {
             }
         }
 
-        Spacer(modifier = Modifier.height(32.dp))
+        Spacer(modifier = Modifier.height(18.dp))
 
         Row(
-            modifier = Modifier.fillMaxWidth().padding(horizontal = 8.dp),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 10.dp),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.Bottom
         ) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(text = "${data.speed}", fontSize = 88.sp, fontWeight = FontWeight.Normal, color = NeonWhite, style = textGlowStyle)
-                Text(text = "Км/ч", fontSize = 18.sp, color = NeonWhite, fontWeight = FontWeight.Medium)
+            Column(
+                modifier = Modifier.weight(1f),
+                horizontalAlignment = Alignment.Start
+            ) {
+                Text(
+                    text = "Скорость",
+                    color = TextGray,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    text = "$displaySpeed",
+                    color = NeonWhite,
+                    fontSize = 64.sp,
+                    fontWeight = FontWeight.Normal,
+                    style = textGlowStyle,
+                    maxLines = 1
+                )
+                Text(
+                    text = "км/ч",
+                    color = NeonWhite,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium
+                )
             }
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(text = "${data.rpm}", fontSize = 56.sp, fontWeight = FontWeight.Normal, color = NeonWhite, style = textGlowStyle)
-                Text(text = "Об/мин", fontSize = 18.sp, color = TextGray, fontWeight = FontWeight.Medium)
+            Spacer(modifier = Modifier.size(18.dp))
+            Column(
+                modifier = Modifier.weight(1f),
+                horizontalAlignment = Alignment.End
+            ) {
+                Text(
+                    text = "Обороты",
+                    color = TextGray,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.Medium
+                )
+                Text(
+                    text = "$displayRpm",
+                    color = NeonWhite,
+                    fontSize = 50.sp,
+                    fontWeight = FontWeight.Normal,
+                    style = textGlowStyle,
+                    maxLines = 1
+                )
+                Text(
+                    text = "об/мин",
+                    color = TextGray,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium
+                )
             }
         }
 
-        Spacer(modifier = Modifier.weight(1f))
-        LinearGradientGauge(
-            label = "ДРОССЕЛЬ: ${data.tps}%",
+        Spacer(modifier = Modifier.height(18.dp))
+
+        CompactProgressGauge(
+            label = "Педаль",
+            valueLabel = "${data.tps}%",
             value = animatedTps,
             maxValue = 100f,
-            labels = listOf("0%", "50%", "100%")
+            modifier = Modifier.fillMaxWidth()
         )
         Spacer(modifier = Modifier.height(24.dp))
 
@@ -238,5 +363,6 @@ fun DashboardScreen(viewModel: BoosterViewModel) {
         ) {
             Text("СБРОС ПИКОВ", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = TextGray, letterSpacing = 1.sp)
         }
+        Spacer(modifier = Modifier.height(12.dp))
     }
 }

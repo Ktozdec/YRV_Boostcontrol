@@ -127,7 +127,8 @@ class BleManager {
                                     baseDuty = json.optDouble("bD", current.baseDuty.toDouble()).toFloat(),
                                     currentDuty = json.optDouble("cD", current.currentDuty.toDouble()).toFloat(),
                                     mode = json.optInt("mode", current.mode),
-                                    lastError = null
+                                    lastError = null,
+                                    telemetryUpdatedAtMillis = System.currentTimeMillis()
                                 )
 
                                 json.has("S") -> current.copy(

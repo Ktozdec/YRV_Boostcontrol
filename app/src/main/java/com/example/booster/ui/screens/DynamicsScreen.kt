@@ -101,6 +101,24 @@ fun DynamicsScreen(viewModel: BoosterViewModel) {
     var time402m by remember { mutableStateOf<Long?>(null) }
     var runDistance by remember { mutableFloatStateOf(0f) }
     var liveTime by remember { mutableLongStateOf(0L) }
+    var telemetryGapDetected by remember { mutableStateOf(false) }
+    var freshnessNow by remember { mutableLongStateOf(System.currentTimeMillis()) }
+
+    val telemetryAgeMs = if (data.telemetryUpdatedAtMillis == 0L) Long.MAX_VALUE else freshnessNow - data.telemetryUpdatedAtMillis
+    val isTelemetryStale = telemetryAgeMs > 700L
+
+    LaunchedEffect(isRunning, freshnessNow) {
+        if (isRunning && data.telemetryUpdatedAtMillis > 0L && telemetryAgeMs > 700L) {
+            telemetryGapDetected = true
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            freshnessNow = System.currentTimeMillis()
+            delay(250)
+        }
+    }
 
     DisposableEffect(Unit) {
         onDispose { isRunning = false }
@@ -114,7 +132,7 @@ fun DynamicsScreen(viewModel: BoosterViewModel) {
             isReadyToStart = true
             if (isRunning) {
                 isRunning = false
-                if (time0to60 != null || time0to100 != null || time402m != null) {
+                if (!telemetryGapDetected && (time0to60 != null || time0to100 != null || time402m != null)) {
                     val df = SimpleDateFormat("dd.MM HH:mm", Locale.getDefault())
                     val newRun = DragRun(df.format(Date()), time0to60, time0to100, time402m)
                     runHistory = (listOf(newRun) + runHistory).take(30)
@@ -130,6 +148,7 @@ fun DynamicsScreen(viewModel: BoosterViewModel) {
             time0to100 = null
             time402m = null
             liveTime = 0L
+            telemetryGapDetected = false
         } else if (isRunning) {
             val currentRunTime = now - startTime
             if (currentSpeed >= 60 && time0to60 == null) time0to60 = currentRunTime
@@ -144,8 +163,10 @@ fun DynamicsScreen(viewModel: BoosterViewModel) {
             val dt = (now - lastTickTime) / 1000f
             lastTickTime = now
 
-            val speedMs = data.speed / 3.6f
-            runDistance += speedMs * dt
+            if (!isTelemetryStale) {
+                val speedMs = data.speed / 3.6f
+                runDistance += speedMs * dt
+            }
             liveTime = now - startTime
 
             if (runDistance >= 402f && time402m == null) {
@@ -174,13 +195,18 @@ fun DynamicsScreen(viewModel: BoosterViewModel) {
         Spacer(modifier = Modifier.height(16.dp))
 
         val statusText = when {
+            isRunning && telemetryGapDetected -> "ПРОПУСК ТЕЛЕМЕТРИИ. ЗАМЕР НЕТОЧЕН"
             isRunning -> "ЗАМЕР АКТИВЕН... (ДО ОСТАНОВКИ)"
             isReadyToStart -> "ОСТАНОВКА. ГОТОВ К СТАРТУ"
             else -> "СБРОС СКОРОСТИ ДО 0 ДЛЯ СТАРТА"
         }
         Text(
             text = statusText,
-            color = if (isReadyToStart) StatusGreen else Color(0xFFFFC107),
+            color = when {
+                isRunning && telemetryGapDetected -> BoostRed
+                isReadyToStart -> StatusGreen
+                else -> Color(0xFFFFC107)
+            },
             fontWeight = FontWeight.Bold,
             letterSpacing = 1.sp
         )
@@ -194,6 +220,10 @@ fun DynamicsScreen(viewModel: BoosterViewModel) {
             Text("Дистанция: ${runDistance.toInt()} м", color = TextGray, fontSize = 14.sp)
         } else {
             Spacer(modifier = Modifier.height(20.dp))
+        }
+
+        if (isTelemetryStale) {
+            Text("Скорость давно не обновлялась", color = Color(0xFFFFC107), fontSize = 12.sp)
         }
 
         Spacer(modifier = Modifier.height(32.dp))
