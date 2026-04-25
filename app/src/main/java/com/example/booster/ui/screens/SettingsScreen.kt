@@ -28,16 +28,12 @@ import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
-import androidx.compose.material3.Tab
-import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
-import androidx.compose.runtime.mutableIntStateOf
-import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -77,17 +73,8 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
     var draftVp by remember { mutableFloatStateOf(0f) }
     var draftLa by remember { mutableFloatStateOf(0f) }
 
-    var selectedTps by remember { mutableIntStateOf(3) }
-    val tpsLabels = listOf("20%", "40%", "70%", "WOT")
-    val rpmLabels = listOf("2000", "2500", "3000", "3500", "4000", "4500", "5000", "5500", "6000", "6500", "7000")
-
-    val mapDraft = remember { List(4) { mutableStateListOf(*Array(11) { 0f }) } }
-    val mapLoaded = remember { List(4) { mutableStateListOf(*Array(11) { 0f }) } }
-    val loadedTabs = remember { mutableStateListOf(false, false, false, false) }
-    val dirtyTabs = remember { mutableStateListOf(false, false, false, false) }
     var isInitialized by remember { mutableStateOf(false) }
     var showOtaDialog by remember { mutableStateOf(false) }
-    val hasMapChanges = dirtyTabs.any { it }
 
     LaunchedEffect(data.targetBoost) {
         if (!isInitialized && data.targetBoost != 0f) {
@@ -110,29 +97,8 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         Toast.makeText(context, "Ошибка ЭБУ: $error", Toast.LENGTH_SHORT).show()
     }
 
-    LaunchedEffect(data) {
-        val t = data.tab
-        if (t in 0..3) {
-            val incomingValues = listOf(
-                data.w0, data.w1, data.w2, data.w3, data.w4, data.w5,
-                data.w6, data.w7, data.w8, data.w9, data.w10
-            )
-            incomingValues.forEachIndexed { index, value ->
-                mapLoaded[t][index] = value
-                if (!dirtyTabs[t]) {
-                    mapDraft[t][index] = value
-                }
-            }
-            loadedTabs[t] = true
-        }
-    }
-
     LaunchedEffect(connectionStatus) {
         if (connectionStatus == "Подключено") {
-            repeat(4) { tab ->
-                viewModel.sendCommand("TAB:$tab")
-                delay(180)
-            }
             viewModel.sendCommand("GET:SETTINGS")
         }
     }
@@ -154,32 +120,6 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         item {
             SettingsCard(title = "Target Boost (Бар)") {
                 TuneRow("Целевой наддув", draftTb, 0.05f, "%.2f", 0.3f, 1.5f) { draftTb = it }
-            }
-        }
-
-        item {
-            SettingsCard(title = "3D Карта Base Duty (%)") {
-                TabRow(selectedTabIndex = selectedTps, containerColor = Color.Transparent, contentColor = NeonWhite) {
-                    tpsLabels.forEachIndexed { index, title ->
-                        Tab(
-                            selected = selectedTps == index,
-                            onClick = {
-                                selectedTps = index
-                                viewModel.sendCommand("TAB:$index")
-                            },
-                            text = { Text(title, color = if (selectedTps == index) NeonWhite else Color.Gray) }
-                        )
-                    }
-                }
-                Spacer(modifier = Modifier.height(8.dp))
-                rpmLabels.forEachIndexed { rIndex, rpmStr ->
-                    TuneRow("$rpmStr RPM", mapDraft[selectedTps][rIndex], 1.0f, "%.1f", 0f, 85f) {
-                        mapDraft[selectedTps][rIndex] = it
-                        dirtyTabs[selectedTps] = (0..10).any { index ->
-                            mapDraft[selectedTps][index] != mapLoaded[selectedTps][index]
-                        }
-                    }
-                }
             }
         }
 
@@ -264,55 +204,8 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
             }
         }
 
-        if (hasMapChanges) {
-            item {
-                val allTabsLoaded = loadedTabs.all { it }
-                Button(
-                    onClick = {
-                        if (!allTabsLoaded) {
-                            Toast.makeText(context, "Дождитесь загрузки всех 4 рядов карты из ЭБУ", Toast.LENGTH_SHORT).show()
-                            return@Button
-                        }
-                        scope.launch {
-                            for (t in 0..3) {
-                                for (r in 0..10) {
-                                    viewModel.sendCommand("SET:M_${t}_${r}:${fmt(clampValue(mapDraft[t][r], 0f, 85f), "%.1f")}")
-                                    delay(90)
-                                }
-                            }
-                            viewModel.sendCommand("SAVE_MAP")
-                            (0..3).forEach { tab ->
-                                (0..10).forEach { index ->
-                                    mapLoaded[tab][index] = mapDraft[tab][index]
-                                }
-                                dirtyTabs[tab] = false
-                            }
-                            Toast.makeText(context, "Карта сохранена в ЭБУ", Toast.LENGTH_SHORT).show()
-                        }
-                    },
-                    modifier = Modifier.fillMaxWidth().padding(bottom = 8.dp).height(56.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = if (allTabsLoaded) BoostBlue else Color.DarkGray)
-                ) {
-                    Text(
-                        "SAVE MAP",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = if (allTabsLoaded) NeonWhite else TextGray
-                    )
-                }
-            }
-        }
-
         item {
             SettingsCard(title = "Сервисные функции") {
-                val allTabsLoaded = loadedTabs.all { it }
-                Text(
-                    if (allTabsLoaded) "Карта загружена полностью" else "Карта загружается: ${loadedTabs.count { it }}/4",
-                    color = if (allTabsLoaded) StatusGreen else Color(0xFFFFC107),
-                    fontSize = 12.sp,
-                    fontWeight = FontWeight.Bold
-                )
-                Spacer(Modifier.height(12.dp))
                 Text("ТЕСТ СОЛЕНОИДА: ${testDutySlider.toInt()}%", fontWeight = FontWeight.Bold, color = NeonWhite)
                 Slider(
                     value = testDutySlider,

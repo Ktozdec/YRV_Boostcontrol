@@ -149,20 +149,20 @@ class BleManager {
                                     lastError = null
                                 )
 
-                                json.has("M") -> current.copy(
-                                    tab = json.optInt("tab", current.tab),
-                                    w0 = json.optDouble("w0", current.w0.toDouble()).toFloat(),
-                                    w1 = json.optDouble("w1", current.w1.toDouble()).toFloat(),
-                                    w2 = json.optDouble("w2", current.w2.toDouble()).toFloat(),
-                                    w3 = json.optDouble("w3", current.w3.toDouble()).toFloat(),
-                                    w4 = json.optDouble("w4", current.w4.toDouble()).toFloat(),
-                                    w5 = json.optDouble("w5", current.w5.toDouble()).toFloat(),
-                                    w6 = json.optDouble("w6", current.w6.toDouble()).toFloat(),
-                                    w7 = json.optDouble("w7", current.w7.toDouble()).toFloat(),
-                                    w8 = json.optDouble("w8", current.w8.toDouble()).toFloat(),
-                                    w9 = json.optDouble("w9", current.w9.toDouble()).toFloat(),
-                                    w10 = json.optDouble("w10", current.w10.toDouble()).toFloat(),
+                                json.has("K") -> current.copy(
+                                    klineBytes = json.optLong("kb", current.klineBytes),
+                                    klineFrames = json.optLong("kf", current.klineFrames),
+                                    klineLastLen = json.optInt("kl", current.klineLastLen),
+                                    klineOverflows = json.optLong("ko", current.klineOverflows),
+                                    klineLastHex = json.optString("kh", current.klineLastHex),
                                     lastError = null
+                                )
+
+                                json.has("KRES") -> current.copy(
+                                    klineResponseHex = json.optString("rx", current.klineResponseHex),
+                                    klineResponseLen = json.optInt("rxl", current.klineResponseLen),
+                                    klineResponseOverflow = json.optInt("ov", current.klineResponseOverflow),
+                                    lastError = if (json.optBoolean("ok", false)) null else "kline_timeout"
                                 )
 
                                 json.has("ack") -> {

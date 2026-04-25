@@ -20,6 +20,7 @@ import com.example.booster.ui.screens.*
 import com.example.booster.viewmodel.BoosterViewModel
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Build
+import androidx.compose.material.icons.filled.BugReport
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Timeline
@@ -31,6 +32,7 @@ sealed class Screen(val route: String, val label: String, val icon: ImageVector)
     object Settings : Screen("settings", "Настройки", Icons.Filled.Settings)
     object Maintenance : Screen("maintenance", "Сервис", Icons.Filled.Build)
     object Dynamics : Screen("dynamics", "Динамика", Icons.Filled.Timeline)
+    object Diagnostics : Screen("diagnostics", "Диагностика", Icons.Filled.BugReport)
 }
 @Composable
 fun BoosterApp() {
@@ -44,7 +46,8 @@ fun BoosterApp() {
         Screen.Dashboard,
         Screen.Settings,
         Screen.Maintenance,
-        Screen.Dynamics
+        Screen.Dynamics,
+        Screen.Diagnostics
     )
 
     Scaffold(
@@ -88,6 +91,9 @@ fun BoosterApp() {
             }
             composable(Screen.Dynamics.route) {
                 DynamicsScreen(boosterViewModel)
+            }
+            composable(Screen.Diagnostics.route) {
+                DiagnosticScreen(boosterViewModel)
             }
         }
     }

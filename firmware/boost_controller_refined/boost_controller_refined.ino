@@ -14,9 +14,12 @@
 #include "esp_system.h"
 
 #define WATCHDOG_TIMEOUT_SEC 5
-#define BLE_MAX_MESSAGE_LEN 96
+#define BLE_MAX_MESSAGE_LEN 180
 #define BLE_NOTIFY_INTERVAL_MS 125
 #define SETTINGS_RESEND_INTERVAL_MS 60
+#define KLINE_BAUD 10400
+#define KLINE_FRAME_GAP_MS 25
+#define KLINE_MAX_FRAME_LEN 48
 
 constexpr uint8_t ADS1115_I2C_ADDR = 0x48;
 constexpr float ADS1115_MULTIPLIER_6V144 = 0.0001875f;
@@ -45,6 +48,7 @@ SemaphoreHandle_t dataMutex;
 SemaphoreHandle_t mapMutex;
 SemaphoreHandle_t configMutex;
 SemaphoreHandle_t bleMutex;
+SemaphoreHandle_t klineMutex;
 TaskHandle_t storageTaskHandle = nullptr;
 
 const int rpmPin = 18;
@@ -52,6 +56,8 @@ const int vssPin = 19;
 const int sdaPin = 23;
 const int sclPin = 22;
 const int solPin = 25;
+const int klineRxPin = 16;
+const int klineTxPin = 17;
 
 #define PCNT_UNIT PCNT_UNIT_0
 
@@ -96,7 +102,6 @@ uint16_t cellSamples[NUM_TPS_BINS][NUM_RPM_BINS];
 bool mapCellDirty = false;
 bool confidenceDirty = false;
 
-volatile int activeBleTab = 3;
 float currentBaseDuty = 40.0f;
 float currentOutDuty = 0.0f;
 
@@ -109,6 +114,7 @@ volatile bool otaModeEnabled = false;
 volatile bool forceMapSaveRequested = false;
 volatile bool forceSettingsSaveRequested = false;
 volatile bool forceOdometerSaveRequested = false;
+volatile bool klineBridgeBusy = false;
 
 enum RebootRequest : uint8_t {
     REBOOT_NONE = 0,
@@ -137,6 +143,18 @@ struct SensorData {
 };
 
 SensorData sensors;
+
+struct KLineState {
+    uint32_t byteCount = 0;
+    uint32_t frameCount = 0;
+    uint32_t overflowCount = 0;
+    uint32_t lastByteAtMs = 0;
+    uint8_t lastByte = 0;
+    uint8_t lastFrameLen = 0;
+    uint8_t lastFrame[KLINE_MAX_FRAME_LEN] = {0};
+};
+
+KLineState klineState;
 
 enum Mode { NORMAL, SOFT_LIMP, HARD_LIMP };
 volatile Mode systemMode = NORMAL;
@@ -284,6 +302,137 @@ void sendBleAck(const char *cmd) {
 void sendBleError(const char *cmd, const char *reason) {
     char buffer[128];
     snprintf(buffer, sizeof(buffer), "{\"ack\":\"%s\",\"ok\":false,\"err\":\"%s\"}\n", cmd, reason);
+    sendBleText(buffer);
+}
+
+void klineFormatFrameHex(const KLineState &state, char *out, size_t outSize) {
+    if (out == nullptr || outSize == 0) return;
+    out[0] = '\0';
+
+    size_t used = 0;
+    for (uint8_t i = 0; i < state.lastFrameLen && used + 3 < outSize; i++) {
+        int written = snprintf(out + used, outSize - used, "%02X", state.lastFrame[i]);
+        if (written <= 0) break;
+        used += static_cast<size_t>(written);
+        if (i + 1 < state.lastFrameLen && used + 2 < outSize) {
+            out[used++] = ' ';
+            out[used] = '\0';
+        }
+    }
+}
+
+void klineCommitFrame(const uint8_t *frame, uint8_t len, bool overflow) {
+    if (frame == nullptr || len == 0) return;
+
+    if (takeMutex(klineMutex, pdMS_TO_TICKS(10))) {
+        klineState.frameCount++;
+        klineState.lastFrameLen = (len < KLINE_MAX_FRAME_LEN) ? len : KLINE_MAX_FRAME_LEN;
+        memcpy(klineState.lastFrame, frame, klineState.lastFrameLen);
+        if (overflow) klineState.overflowCount++;
+        xSemaphoreGive(klineMutex);
+    }
+
+    char hex[KLINE_MAX_FRAME_LEN * 3] = {0};
+    KLineState snapshot;
+    if (takeMutex(klineMutex, pdMS_TO_TICKS(10))) {
+        snapshot = klineState;
+        xSemaphoreGive(klineMutex);
+        klineFormatFrameHex(snapshot, hex, sizeof(hex));
+        Serial.printf("KLINE frame len=%u data=%s%s\n", snapshot.lastFrameLen, hex, overflow ? " overflow" : "");
+    }
+}
+
+KLineState snapshotKLine() {
+    KLineState local = {};
+    if (takeMutex(klineMutex, pdMS_TO_TICKS(10))) {
+        local = klineState;
+        xSemaphoreGive(klineMutex);
+    }
+    return local;
+}
+
+bool parseHexCommand(const String &hex, uint8_t *out, uint8_t &outLen, uint8_t maxLen) {
+    outLen = 0;
+    int highNibble = -1;
+
+    for (uint16_t i = 0; i < hex.length(); i++) {
+        char c = hex.charAt(i);
+        if (c == ' ' || c == ':' || c == '-' || c == ',') continue;
+
+        int value = -1;
+        if (c >= '0' && c <= '9') value = c - '0';
+        else if (c >= 'A' && c <= 'F') value = c - 'A' + 10;
+        else if (c >= 'a' && c <= 'f') value = c - 'a' + 10;
+        else return false;
+
+        if (highNibble < 0) {
+            highNibble = value;
+        } else {
+            if (outLen >= maxLen) return false;
+            out[outLen++] = static_cast<uint8_t>((highNibble << 4) | value);
+            highNibble = -1;
+        }
+    }
+
+    return highNibble < 0 && outLen > 0;
+}
+
+void sendKLineRequest(const String &hex) {
+    uint8_t tx[KLINE_MAX_FRAME_LEN] = {0};
+    uint8_t txLen = 0;
+    if (!parseHexCommand(hex, tx, txLen, KLINE_MAX_FRAME_LEN)) {
+        sendBleError("KREQ", "bad_hex");
+        return;
+    }
+
+    if (klineBridgeBusy) {
+        sendBleError("KREQ", "busy");
+        return;
+    }
+
+    klineBridgeBusy = true;
+    while (Serial2.available() > 0) Serial2.read();
+    Serial2.write(tx, txLen);
+    Serial2.flush();
+
+    uint8_t rx[KLINE_MAX_FRAME_LEN] = {0};
+    uint8_t rxLen = 0;
+    bool overflow = false;
+    uint32_t startedAtMs = millis();
+    uint32_t lastByteAtMs = 0;
+
+    while (millis() - startedAtMs < 350) {
+        while (Serial2.available() > 0) {
+            uint8_t b = static_cast<uint8_t>(Serial2.read());
+            if (rxLen < KLINE_MAX_FRAME_LEN) {
+                rx[rxLen++] = b;
+            } else {
+                overflow = true;
+            }
+            lastByteAtMs = millis();
+        }
+
+        if (rxLen > 0 && millis() - lastByteAtMs >= KLINE_FRAME_GAP_MS) break;
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+
+    klineBridgeBusy = false;
+
+    KLineState response = {};
+    response.lastFrameLen = rxLen;
+    memcpy(response.lastFrame, rx, rxLen);
+    char responseHex[KLINE_MAX_FRAME_LEN * 3] = {0};
+    klineFormatFrameHex(response, responseHex, sizeof(responseHex));
+
+    char buffer[320];
+    snprintf(buffer, sizeof(buffer),
+        "{\"KRES\":1,\"ok\":%s,\"txl\":%u,\"rxl\":%u,\"ov\":%u,\"rx\":\"%s\"}\n",
+        rxLen > 0 ? "true" : "false",
+        txLen,
+        rxLen,
+        overflow ? 1 : 0,
+        responseHex
+    );
     sendBleText(buffer);
 }
 
@@ -535,33 +684,12 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
             cfg.tireR = iValue;
             calcWheelSizeLocked();
         }
-    } else if (key.startsWith("M_")) {
-        int firstUs = key.indexOf('_');
-        int secondUs = key.indexOf('_', firstUs + 1);
-        int t = -1;
-        int r = -1;
-        if (firstUs == -1 || secondUs == -1 ||
-            !parseIntStrict(key.substring(firstUs + 1, secondUs), 0, NUM_TPS_BINS - 1, t) ||
-            !parseIntStrict(key.substring(secondUs + 1), 0, NUM_RPM_BINS - 1, r) ||
-            !parseFloatStrict(rawValue, 0.0f, 85.0f, fValue)) {
-            ok = false;
-        } else if (takeMutex(mapMutex, pdMS_TO_TICKS(80))) {
-            dutyMap2D[t][r] = fValue;
-            sanitizeMapProfileLocked();
-            mapCellDirty = true;
-            confidenceDirty = true;
-            mapNeedsSaving = true;
-            xSemaphoreGive(mapMutex);
-        } else {
-            ok = false;
-            error = "map_busy";
-        }
     } else {
         ok = false;
         error = "unknown_key";
     }
 
-    if (ok && error.length() == 0 && !key.startsWith("M_")) settingsNeedsSaving = true;
+    if (ok && error.length() == 0) settingsNeedsSaving = true;
     if (!ok && error.length() == 0) error = "bad_value";
 
     xSemaphoreGive(configMutex);
@@ -601,18 +729,6 @@ class MyCallbacks : public BLECharacteristicCallbacks {
             return;
         }
 
-        if (msg.startsWith("TAB:")) {
-            int tab = 0;
-            if (parseIntStrict(msg.substring(4), 0, NUM_TPS_BINS - 1, tab)) {
-                activeBleTab = tab;
-                sendSettingsRequested = true;
-                sendBleAck("TAB");
-            } else {
-                sendBleError("TAB", "bad_tab");
-            }
-            return;
-        }
-
         if (msg.startsWith("DUTY:")) {
             int duty = 0;
             if (parseIntStrict(msg.substring(5), 0, 100, duty)) {
@@ -636,23 +752,18 @@ class MyCallbacks : public BLECharacteristicCallbacks {
             return;
         }
 
+        if (msg.startsWith("KREQ:")) {
+            sendKLineRequest(msg.substring(5));
+            return;
+        }
+
         if (msg == "SAVE") {
             settingsNeedsSaving = true;
-            mapNeedsSaving = true;
             odometerNeedsSaving = true;
-            forceMapSaveRequested = true;
             forceSettingsSaveRequested = true;
             forceOdometerSaveRequested = true;
             notifyStorageTask();
             sendBleAck("SAVE");
-            return;
-        }
-
-        if (msg == "SAVE_MAP") {
-            mapNeedsSaving = true;
-            forceMapSaveRequested = true;
-            notifyStorageTask();
-            sendBleAck("SAVE_MAP");
             return;
         }
 
@@ -672,18 +783,6 @@ class MyCallbacks : public BLECharacteristicCallbacks {
 
             String key = data.substring(0, sepIndex);
             String val = data.substring(sepIndex + 1);
-
-            if (key == "TAB") {
-                int tab = 0;
-                if (parseIntStrict(val, 0, NUM_TPS_BINS - 1, tab)) {
-                    activeBleTab = tab;
-                    sendSettingsRequested = true;
-                    sendBleAck("SET:TAB");
-                } else {
-                    sendBleError("SET:TAB", "bad_tab");
-                }
-                return;
-            }
 
             String error;
             if (updateSettingValue(key, val, error)) {
@@ -775,6 +874,53 @@ void updateSafety(const SensorData &d) {
         systemMode = SOFT_LIMP;
     } else {
         systemMode = NORMAL;
+    }
+}
+
+void TaskKLineReader(void *pvParameters) {
+    (void)pvParameters;
+    esp_task_wdt_add(nullptr);
+
+    uint8_t frame[KLINE_MAX_FRAME_LEN] = {0};
+    uint8_t frameLen = 0;
+    bool overflow = false;
+    uint32_t lastByteAtMs = 0;
+
+    for (;;) {
+        if (klineBridgeBusy) {
+            esp_task_wdt_reset();
+            vTaskDelay(pdMS_TO_TICKS(5));
+            continue;
+        }
+
+        while (Serial2.available() > 0) {
+            uint8_t b = static_cast<uint8_t>(Serial2.read());
+            uint32_t now = millis();
+
+            if (frameLen < KLINE_MAX_FRAME_LEN) {
+                frame[frameLen++] = b;
+            } else {
+                overflow = true;
+            }
+
+            if (takeMutex(klineMutex, pdMS_TO_TICKS(5))) {
+                klineState.byteCount++;
+                klineState.lastByte = b;
+                klineState.lastByteAtMs = now;
+                xSemaphoreGive(klineMutex);
+            }
+
+            lastByteAtMs = now;
+        }
+
+        if (frameLen > 0 && millis() - lastByteAtMs >= KLINE_FRAME_GAP_MS) {
+            klineCommitFrame(frame, frameLen, overflow);
+            frameLen = 0;
+            overflow = false;
+        }
+
+        esp_task_wdt_reset();
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 }
 
@@ -972,6 +1118,7 @@ void TaskTelemetry(void *pvParameters) {
     SensorData d = {};
     uint32_t lastPrint = millis();
     uint32_t lastNotifyMs = 0;
+    uint32_t lastKLineNotifyMs = 0;
 
     for (;;) {
         if (takeMutex(dataMutex, pdMS_TO_TICKS(40))) {
@@ -980,11 +1127,17 @@ void TaskTelemetry(void *pvParameters) {
         }
 
         if (millis() - lastPrint > 5000) {
+            KLineState kline = snapshotKLine();
             Serial.printf("Diag Heap:%u MaxBlock:%u TelStack:%u Mode:%d\n",
                 ESP.getFreeHeap(),
                 ESP.getMaxAllocHeap(),
                 uxTaskGetStackHighWaterMark(nullptr),
                 static_cast<int>(systemMode));
+            Serial.printf("KLINE bytes:%lu frames:%lu lastLen:%u overflows:%lu\n",
+                static_cast<unsigned long>(kline.byteCount),
+                static_cast<unsigned long>(kline.frameCount),
+                kline.lastFrameLen,
+                static_cast<unsigned long>(kline.overflowCount));
             lastPrint = millis();
         }
 
@@ -1002,17 +1155,6 @@ void TaskTelemetry(void *pvParameters) {
                 sendBleText(bleBuffer);
                 vTaskDelay(pdMS_TO_TICKS(SETTINGS_RESEND_INTERVAL_MS));
 
-                if (takeMutex(mapMutex, pdMS_TO_TICKS(40))) {
-                    int tab = constrain(activeBleTab, 0, NUM_TPS_BINS - 1);
-                    snprintf(bleBuffer, sizeof(bleBuffer),
-                        "{\"M\":1,\"tab\":%d,\"w0\":%.1f,\"w1\":%.1f,\"w2\":%.1f,\"w3\":%.1f,\"w4\":%.1f,\"w5\":%.1f,\"w6\":%.1f,\"w7\":%.1f,\"w8\":%.1f,\"w9\":%.1f,\"w10\":%.1f}\n",
-                        tab,
-                        dutyMap2D[tab][0], dutyMap2D[tab][1], dutyMap2D[tab][2], dutyMap2D[tab][3], dutyMap2D[tab][4],
-                        dutyMap2D[tab][5], dutyMap2D[tab][6], dutyMap2D[tab][7], dutyMap2D[tab][8], dutyMap2D[tab][9], dutyMap2D[tab][10]
-                    );
-                    xSemaphoreGive(mapMutex);
-                    sendBleText(bleBuffer);
-                }
                 sendSettingsRequested = false;
                 vTaskDelay(pdMS_TO_TICKS(SETTINGS_RESEND_INTERVAL_MS));
             }
@@ -1024,6 +1166,22 @@ void TaskTelemetry(void *pvParameters) {
             );
             sendBleText(bleBuffer);
             lastNotifyMs = millis();
+
+            if (millis() - lastKLineNotifyMs >= 1000) {
+                KLineState kline = snapshotKLine();
+                char klineHex[KLINE_MAX_FRAME_LEN * 3] = {0};
+                klineFormatFrameHex(kline, klineHex, sizeof(klineHex));
+                snprintf(bleBuffer, sizeof(bleBuffer),
+                    "{\"K\":1,\"kb\":%lu,\"kf\":%lu,\"kl\":%u,\"ko\":%lu,\"kh\":\"%s\"}\n",
+                    static_cast<unsigned long>(kline.byteCount),
+                    static_cast<unsigned long>(kline.frameCount),
+                    kline.lastFrameLen,
+                    static_cast<unsigned long>(kline.overflowCount),
+                    klineHex
+                );
+                sendBleText(bleBuffer);
+                lastKLineNotifyMs = millis();
+            }
         }
 
         esp_task_wdt_reset();
@@ -1192,7 +1350,8 @@ void setup() {
     mapMutex = xSemaphoreCreateMutex();
     configMutex = xSemaphoreCreateMutex();
     bleMutex = xSemaphoreCreateMutex();
-    if (dataMutex == nullptr || mapMutex == nullptr || configMutex == nullptr || bleMutex == nullptr) {
+    klineMutex = xSemaphoreCreateMutex();
+    if (dataMutex == nullptr || mapMutex == nullptr || configMutex == nullptr || bleMutex == nullptr || klineMutex == nullptr) {
         Serial.println("Crit Error: Mutex creation failed!");
     }
 
@@ -1255,6 +1414,11 @@ void setup() {
     attachInterrupt(digitalPinToInterrupt(rpmPin), handleRPM, FALLING);
     initPCNT();
 
+    pinMode(klineTxPin, OUTPUT);
+    digitalWrite(klineTxPin, HIGH);
+    Serial2.begin(KLINE_BAUD, SERIAL_8N1, klineRxPin, klineTxPin);
+    Serial.printf("K-Line listen-only UART started: RX=%d TX=%d baud=%d\n", klineRxPin, klineTxPin, KLINE_BAUD);
+
     ledcAttach(solPin, pwmFreq, pwmRes);
     ledcWrite(solPin, 0);
 
@@ -1282,6 +1446,7 @@ void setup() {
     pAdvertising->start();
 
     xTaskCreatePinnedToCore(TaskSensors, "SENS", 4096, nullptr, 2, nullptr, 0);
+    xTaskCreatePinnedToCore(TaskKLineReader, "KLINE", 3072, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(TaskControl, "CTRL", 4096, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(TaskPWM, "PWM", 3072, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(TaskTelemetry, "TELEM", 4096, nullptr, 1, nullptr, 1);
