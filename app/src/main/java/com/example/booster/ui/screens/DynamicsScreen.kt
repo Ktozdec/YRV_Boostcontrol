@@ -1,5 +1,8 @@
-﻿package com.example.booster.ui.screens
+package com.example.booster.ui.screens
 
+import android.widget.Toast
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -54,8 +57,23 @@ private data class DragRun(val date: String, val t60: Long?, val t100: Long?, va
 @Composable
 fun DynamicsScreen(viewModel: BoosterViewModel) {
     val data by viewModel.telemetry.collectAsStateWithLifecycle()
+    val tripLogSize by viewModel.tripLogSize.collectAsStateWithLifecycle()
     val context = LocalContext.current
     val prefs = remember { AppPreferencesRepository(context) }.dynamicsPrefs
+    val saveLogLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/csv")
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        runCatching {
+            context.contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { writer ->
+                writer.write(viewModel.exportTripLogCsv())
+            } ?: error("Не удалось открыть файл")
+        }.onSuccess {
+            Toast.makeText(context, "Лог сохранен", Toast.LENGTH_SHORT).show()
+        }.onFailure { error ->
+            Toast.makeText(context, "Не удалось сохранить лог: ${error.message}", Toast.LENGTH_LONG).show()
+        }
+    }
 
     fun loadHistory(): List<DragRun> {
         val str = prefs.getString("drag_history_json", null) ?: return emptyList()
@@ -243,6 +261,22 @@ fun DynamicsScreen(viewModel: BoosterViewModel) {
             border = BorderStroke(1.dp, Color(0xFF444444))
         ) {
             Text("ИСТОРИЯ ЗАМЕРОВ", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = NeonWhite)
+        }
+        Spacer(modifier = Modifier.height(12.dp))
+        OutlinedButton(
+            onClick = {
+                if (tripLogSize == 0) {
+                    Toast.makeText(context, "Лог пока пуст", Toast.LENGTH_SHORT).show()
+                } else {
+                    saveLogLauncher.launch(viewModel.defaultTripLogFileName())
+                }
+            },
+            modifier = Modifier.fillMaxWidth().height(56.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.outlinedButtonColors(containerColor = TrackBg),
+            border = BorderStroke(1.dp, BoostBlue.copy(alpha = 0.5f))
+        ) {
+            Text("СОХРАНИТЬ ЛОГ (${tripLogSize})", fontSize = 16.sp, fontWeight = FontWeight.Bold, color = NeonWhite)
         }
     }
 

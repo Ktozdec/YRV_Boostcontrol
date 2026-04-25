@@ -59,12 +59,13 @@ const int pwmFreq = 30;
 const int pwmRes = 8;
 volatile int activePwmDuty = 0;
 volatile int testDuty = 0;
+volatile float latchedGearBoostTrim = 0.20f;
 
 struct PID_Config {
-    float kP = 25.0f;
-    float kI = 15.0f;
-    float kD = 15.0f;
-    float learnCoeff = 0.03f;
+    float kP = 24.0f;
+    float kI = 12.0f;
+    float kD = 12.0f;
+    float learnCoeff = 0.02f;
     float integral = 0.0f;
     float lastError = 0.0f;
     float filteredDerivative = 0.0f;
@@ -159,12 +160,24 @@ struct LearningState {
     uint32_t stableSinceMs = 0;
 } learningState;
 
+float filteredDynamicTarget = 0.80f;
+bool filteredDynamicTargetInitialized = false;
+
 inline float constrainFloat(float x, float a, float b) {
     return x < a ? a : (x > b ? b : x);
 }
 
 bool isFiniteFloat(float value) {
     return !isnan(value) && !isinf(value);
+}
+
+float computeGearBoostTrim(float rpm, float speed, float previousTrim) {
+    if (speed <= 10.0f) return 0.20f;
+
+    const float gearRatio = rpm / max(speed, 1.0f);
+
+    if (gearRatio > 105.0f) return 0.20f;
+    return 0.0f;
 }
 
 bool parseIntStrict(const String &s, int minV, int maxV, int &out) {
@@ -821,6 +834,9 @@ void TaskSensors(void *pvParameters) {
             float instSpeed = (frequencyHz / localCfg.vssPulsesPerRev) * localCfg.wheelSizeM * 3.6f;
             smoothedSpeed = smoothedSpeed * 0.7f + instSpeed * 0.3f;
             if (smoothedSpeed < 2.0f && frequencyHz == 0.0f) smoothedSpeed = 0.0f;
+
+            float nextGearTrim = computeGearBoostTrim(medRPM, smoothedSpeed, latchedGearBoostTrim);
+            latchedGearBoostTrim = nextGearTrim;
             lastSpdCalcMs = nowMs;
         }
 
@@ -859,20 +875,24 @@ void TaskControl(void *pvParameters) {
 
         updateSafety(d);
         currentBaseDuty = getMappedBaseDuty2D(d.rpm, d.tps);
-        float dynamicTarget = localCfg.targetBoost;
-
-        if (d.speed > 10.0f) {
-            float gearRatio = d.rpm / max(d.speed, 1.0f);
-            if (gearRatio > 100.0f) dynamicTarget -= 0.20f;
-            else if (gearRatio > 60.0f) dynamicTarget -= 0.10f;
-        } else {
-            dynamicTarget -= 0.20f;
-        }
 
         uint32_t now = millis();
         float dt = (now - lastPidTime) / 1000.0f;
         if (dt <= 0.001f) dt = 0.05f;
         lastPidTime = now;
+
+        float targetTrim = latchedGearBoostTrim;
+        float desiredDynamicTarget = constrainFloat(localCfg.targetBoost - targetTrim, 0.30f, localCfg.targetBoost);
+        if (!filteredDynamicTargetInitialized) {
+            filteredDynamicTarget = desiredDynamicTarget;
+            filteredDynamicTargetInitialized = true;
+        } else {
+            const float targetFilterTauSec = 0.35f;
+            float alpha = dt / (targetFilterTauSec + dt);
+            filteredDynamicTarget += (desiredDynamicTarget - filteredDynamicTarget) * alpha;
+        }
+
+        float dynamicTarget = filteredDynamicTarget;
 
         if (systemMode == NORMAL && d.tps > 10.0f && d.rpm >= 1300.0f) {
             float err = dynamicTarget - d.boost;
@@ -885,8 +905,7 @@ void TaskControl(void *pvParameters) {
 
             float duty = currentBaseDuty + (err * pid.kP) + pid.integral + (pid.filteredDerivative * pid.kD);
             if (d.boost > dynamicTarget + 0.15f) {
-                duty -= 10.0f;
-                pid.integral *= 0.45f;
+                pid.integral *= 0.90f;
             }
             if (duty > 85.0f || duty < 0.0f) pid.integral *= 0.92f;
 
@@ -901,6 +920,7 @@ void TaskControl(void *pvParameters) {
             learningState.stableSinceMs = millis();
             pid.integral *= 0.90f;
             pid.lastError = 0.0f;
+            pid.filteredDerivative = 0.0f;
             currentOutDuty = (systemMode == SOFT_LIMP) ? 20.0f : 0.0f;
         }
 
@@ -1200,10 +1220,10 @@ void setup() {
         cfg.tireA = constrain(prefs.getInt("tA", 55), 20, 100);
         cfg.tireR = constrain(prefs.getInt("tR", 15), 10, 24);
         calcWheelSizeLocked();
-        pid.kP = constrainFloat(prefs.getFloat("kP", 25.0f), 0.0f, 200.0f);
-        pid.kI = constrainFloat(prefs.getFloat("kI", 15.0f), 0.0f, 200.0f);
-        pid.kD = constrainFloat(prefs.getFloat("kD", 15.0f), 0.0f, 50.0f);
-        pid.learnCoeff = constrainFloat(prefs.getFloat("lA", 0.03f), 0.005f, 0.15f);
+        pid.kP = constrainFloat(prefs.getFloat("kP", 24.0f), 0.0f, 200.0f);
+        pid.kI = constrainFloat(prefs.getFloat("kI", 12.0f), 0.0f, 200.0f);
+        pid.kD = constrainFloat(prefs.getFloat("kD", 12.0f), 0.0f, 50.0f);
+        pid.learnCoeff = constrainFloat(prefs.getFloat("lA", 0.02f), 0.005f, 0.15f);
         xSemaphoreGive(configMutex);
     }
 
