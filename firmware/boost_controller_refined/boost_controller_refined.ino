@@ -39,6 +39,47 @@ constexpr uint16_t ADS1115_CFG_BASE =
 constexpr float SOFT_LIMP_BOOST_BAR = 1.05f;
 constexpr float HARD_LIMP_BOOST_BAR = 1.15f;
 
+// =============================== ADAPTIVE TUNING ===============================
+// One place for the knobs that shape boost behaviour and self-learning.
+// (Protection thresholds are SOFT_LIMP_BOOST_BAR / HARD_LIMP_BOOST_BAR above.)
+
+// -- PID base gains (also power-on defaults; a saved value in NVS overrides them) --
+constexpr float DEFAULT_KP = 28.0f;
+constexpr float DEFAULT_KI = 16.0f;
+constexpr float DEFAULT_KD = 10.0f;
+constexpr float INTEGRAL_LIMIT      = 30.0f;   // anti-windup clamp on the integral term
+constexpr float TARGET_FILTER_TAU_S = 0.35f;   // smoothing time constant for the boost target
+
+// -- Self-learning (adaptive feed-forward map) --
+constexpr float DEFAULT_LEARN_RATE  = 0.10f;   // lA: fraction of the steady integral bias baked into the map per update
+constexpr float LEARN_RATE_MIN      = 0.02f;
+constexpr float LEARN_RATE_MAX      = 0.30f;
+constexpr float MAP_LEARN_MAX_STEP  = 0.8f;    // max % duty baked into the map per update
+constexpr float INTEGRAL_TRANSFER   = 0.85f;   // fraction of the offloaded bias removed from the integral
+constexpr float MAP_MAX_RPM_DELTA   = 18.0f;   // sanity slope limit between adjacent RPM cells (% duty)
+constexpr float MAP_DUTY_MIN        = 0.0f;
+constexpr float MAP_DUTY_MAX        = 85.0f;
+
+// -- Learning window: when it is safe to adapt the map --
+constexpr float LEARN_MAX_TPS_DELTA   = 4.0f;
+constexpr float LEARN_MAX_RPM_DELTA   = 250.0f;
+constexpr float LEARN_MAX_BOOST_DELTA = 0.08f;
+constexpr float LEARN_MAX_ERR         = 0.30f;
+constexpr float LEARN_MIN_TPS         = 12.0f;
+constexpr float LEARN_MIN_RPM         = 1600.0f;
+constexpr float LEARN_MIN_SPEED       = 6.0f;
+constexpr uint32_t LEARN_HOLD_MS      = 300;
+
+// -- Transient feel: setpoint feed-forward + RPM gain scheduling --
+constexpr float SETPOINT_FF_GAIN = 3.0f;   // % duty per (bar/s) of rising target — anticipates spool
+constexpr float SETPOINT_FF_CAP  = 8.0f;   // clamp on setpoint feed-forward (% duty)
+constexpr float GAIN_SPOOL    = 1.30f;     // kP multiplier at/below GAIN_RPM_LOW (aggressive spool)
+constexpr float GAIN_TOP      = 0.85f;     // kP multiplier at/above GAIN_RPM_HIGH (gentle, no overshoot)
+constexpr float GAIN_RPM_LOW  = 2500.0f;
+constexpr float GAIN_RPM_MID  = 4000.0f;   // multiplier = 1.0 here
+constexpr float GAIN_RPM_HIGH = 6000.0f;
+// ===============================================================================
+
 const float ATMOS_MIN_VOLTS    = 2.40f;
 const float ATMOS_MAX_VOLTS    = 2.70f;
 const float DEFAULT_OFFSET     = 2.57f;
@@ -80,22 +121,15 @@ volatile int testDuty = 0;
 volatile float latchedGearBoostTrim = 0.20f;
 
 struct PID_Config {
-    float kP = 28.0f;
-    float kI = 16.0f;
-    float kD = 10.0f;
-    float learnCoeff = 0.10f;   // integral-offload rate: fraction of steady bias baked into the map per update
+    float kP = DEFAULT_KP;
+    float kI = DEFAULT_KI;
+    float kD = DEFAULT_KD;
+    float learnCoeff = DEFAULT_LEARN_RATE;   // integral-offload rate (see ADAPTIVE TUNING above)
     float integral = 0.0f;
     float lastError = 0.0f;
     float lastMeas = 0.0f;      // last boost reading, for derivative-on-measurement (no setpoint kick)
     float filteredDerivative = 0.0f;
 } pid;
-
-// Adaptive feed-forward tuning
-constexpr float MAP_LEARN_MAX_STEP = 0.8f;   // max % duty baked into the map per learning update
-constexpr float INTEGRAL_TRANSFER  = 0.85f;  // fraction of the offloaded bias removed from the integral
-// Transient feel
-constexpr float SETPOINT_FF_GAIN   = 3.0f;   // % duty per (bar/s) of rising target — anticipates spool
-constexpr float SETPOINT_FF_CAP    = 8.0f;   // clamp on setpoint feed-forward (% duty)
 
 struct RuntimeConfig {
     float offsetPIM = 2.57f;
@@ -270,15 +304,14 @@ void calcWheelSizeLocked() {
 void sanitizeMapProfileLocked() {
     for (int t = 0; t < NUM_TPS_BINS; t++) {
         for (int r = 0; r < NUM_RPM_BINS; r++) {
-            dutyMap2D[t][r] = constrainFloat(dutyMap2D[t][r], 0.0f, 85.0f);
+            dutyMap2D[t][r] = constrainFloat(dutyMap2D[t][r], MAP_DUTY_MIN, MAP_DUTY_MAX);
             confidence[t][r] = constrainFloat(confidence[t][r], 0.05f, 1.0f);
             if (r > 0) {
-                // Sanity slope limit between adjacent RPM cells — raised so it guards against
-                // corrupt jumps without fighting legitimately learned steps.
-                const float maxDelta = 18.0f;
+                // Sanity slope limit between adjacent RPM cells — guards against corrupt
+                // jumps without fighting legitimately learned steps.
                 float delta = dutyMap2D[t][r] - dutyMap2D[t][r - 1];
-                if (delta > maxDelta) dutyMap2D[t][r] = dutyMap2D[t][r - 1] + maxDelta;
-                if (delta < -maxDelta) dutyMap2D[t][r] = dutyMap2D[t][r - 1] - maxDelta;
+                if (delta > MAP_MAX_RPM_DELTA) dutyMap2D[t][r] = dutyMap2D[t][r - 1] + MAP_MAX_RPM_DELTA;
+                if (delta < -MAP_MAX_RPM_DELTA) dutyMap2D[t][r] = dutyMap2D[t][r - 1] - MAP_MAX_RPM_DELTA;
             }
         }
     }
@@ -569,12 +602,11 @@ float getTargetShape(float currentRpm) {
 }
 
 // Gain scheduling: more aggressive in the spool zone, gentler up top to avoid overshoot.
-// 1.30x at/below 2500 rpm, 1.0x at 4000, 0.85x at/above 6000, linear between.
 float spoolGainFactor(float currentRpm) {
-    if (currentRpm <= 2500.0f) return 1.30f;
-    if (currentRpm < 4000.0f)  return 1.30f + (currentRpm - 2500.0f) * (1.00f - 1.30f) / (4000.0f - 2500.0f);
-    if (currentRpm <= 6000.0f) return 1.00f + (currentRpm - 4000.0f) * (0.85f - 1.00f) / (6000.0f - 4000.0f);
-    return 0.85f;
+    if (currentRpm <= GAIN_RPM_LOW) return GAIN_SPOOL;
+    if (currentRpm < GAIN_RPM_MID)  return GAIN_SPOOL + (currentRpm - GAIN_RPM_LOW) * (1.00f - GAIN_SPOOL) / (GAIN_RPM_MID - GAIN_RPM_LOW);
+    if (currentRpm <= GAIN_RPM_HIGH) return 1.00f + (currentRpm - GAIN_RPM_MID) * (GAIN_TOP - 1.00f) / (GAIN_RPM_HIGH - GAIN_RPM_MID);
+    return GAIN_TOP;
 }
 
 bool learningWindowStable(const SensorData &d, float err) {
@@ -587,13 +619,13 @@ bool learningWindowStable(const SensorData &d, float err) {
     // instantaneous error), we can safely capture far more of real driving, including
     // the spool region and lighter loads.
     bool locallyStable =
-        tpsDelta < 4.0f &&
-        rpmDelta < 250.0f &&
-        boostDelta < 0.08f &&
-        fabs(err) < 0.30f &&
-        d.tps > 12.0f &&
-        d.rpm > 1600.0f &&
-        d.speed > 6.0f &&
+        tpsDelta < LEARN_MAX_TPS_DELTA &&
+        rpmDelta < LEARN_MAX_RPM_DELTA &&
+        boostDelta < LEARN_MAX_BOOST_DELTA &&
+        fabs(err) < LEARN_MAX_ERR &&
+        d.tps > LEARN_MIN_TPS &&
+        d.rpm > LEARN_MIN_RPM &&
+        d.speed > LEARN_MIN_SPEED &&
         systemMode == NORMAL;
 
     if (!locallyStable) {
@@ -604,7 +636,7 @@ bool learningWindowStable(const SensorData &d, float err) {
     learningState.lastRpm = d.rpm;
     learningState.lastBoost = d.boost;
 
-    return locallyStable && (now - learningState.stableSinceMs >= 300);
+    return locallyStable && (now - learningState.stableSinceMs >= LEARN_HOLD_MS);
 }
 
 void smoothCellTowardsNeighborsLocked(int tt, int rr) {
@@ -664,7 +696,7 @@ void learnDutyMap3D(float currentRpm, float currentTps, float dutyDelta, float r
         confidenceDirty = true;
 
         if (applyMapStep && w > 0.001f) {
-            dutyMap2D[tt][rr] = constrainFloat(dutyMap2D[tt][rr] + boundedDelta * w, 0.0f, 85.0f);
+            dutyMap2D[tt][rr] = constrainFloat(dutyMap2D[tt][rr] + boundedDelta * w, MAP_DUTY_MIN, MAP_DUTY_MAX);
             smoothCellTowardsNeighborsLocked(tt, rr);
             if (cellSamples[tt][rr] < 60000) cellSamples[tt][rr]++;
             mapCellDirty = true;
@@ -713,7 +745,7 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
         ok = parseFloatStrict(rawValue, 0.0f, 50.0f, fValue);
         if (ok) pid.kD = fValue;
     } else if (key == "lA") {
-        ok = parseFloatStrict(rawValue, 0.02f, 0.30f, fValue);
+        ok = parseFloatStrict(rawValue, LEARN_RATE_MIN, LEARN_RATE_MAX, fValue);
         if (ok) pid.learnCoeff = fValue;
     } else if (key == "vP") {
         ok = parseFloatStrict(rawValue, 1.0f, 40.0f, fValue);
@@ -1118,8 +1150,7 @@ void TaskControl(void *pvParameters) {
             filteredDynamicTarget = desiredDynamicTarget;
             filteredDynamicTargetInitialized = true;
         } else {
-            const float targetFilterTauSec = 0.35f;
-            float alpha = dt / (targetFilterTauSec + dt);
+            float alpha = dt / (TARGET_FILTER_TAU_S + dt);
             filteredDynamicTarget += (desiredDynamicTarget - filteredDynamicTarget) * alpha;
         }
 
@@ -1143,7 +1174,7 @@ void TaskControl(void *pvParameters) {
             pid.lastError = err;
 
             float integralCandidate = pid.integral + err * kiEff * dt;
-            pid.integral = constrainFloat(integralCandidate, -30.0f, 30.0f);
+            pid.integral = constrainFloat(integralCandidate, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
 
             // Setpoint feed-forward: anticipate a rising target to spool faster (help only, never fight).
             float setpointFF = constrainFloat(targetRate * SETPOINT_FF_GAIN, 0.0f, SETPOINT_FF_CAP);
@@ -1485,19 +1516,20 @@ void setup() {
         cfg.tireR = constrain(prefs.getInt("tR", 15), 10, 24);
         cfg.limitBoostBar = constrainFloat(prefs.getFloat("lB", 0.95f), 0.3f, 2.0f);
         calcWheelSizeLocked();
-        pid.kP = constrainFloat(prefs.getFloat("kP", 28.0f), 0.0f, 200.0f);
-        pid.kI = constrainFloat(prefs.getFloat("kI", 16.0f), 0.0f, 200.0f);
-        pid.kD = constrainFloat(prefs.getFloat("kD", 10.0f), 0.0f, 50.0f);
-        pid.learnCoeff = constrainFloat(prefs.getFloat("lA", 0.10f), 0.02f, 0.30f);
+        pid.kP = constrainFloat(prefs.getFloat("kP", DEFAULT_KP), 0.0f, 200.0f);
+        pid.kI = constrainFloat(prefs.getFloat("kI", DEFAULT_KI), 0.0f, 200.0f);
+        pid.kD = constrainFloat(prefs.getFloat("kD", DEFAULT_KD), 0.0f, 50.0f);
+        pid.learnCoeff = constrainFloat(prefs.getFloat("lA", DEFAULT_LEARN_RATE), LEARN_RATE_MIN, LEARN_RATE_MAX);
 
         // One-time migration to the v5 adaptive tune. The meaning of lA changed (it is now the
         // integral-offload rate), so old saved gains must be refreshed once. Calibration,
-        // odometer and the learned map are preserved.
+        // odometer and the learned map are preserved. (On a full-erase flash this is a no-op
+        // because the defaults above already equal these values.)
         if (prefs.getInt("tuneVer", 0) < 5) {
-            pid.kP = 28.0f;
-            pid.kI = 16.0f;
-            pid.kD = 10.0f;
-            pid.learnCoeff = 0.10f;
+            pid.kP = DEFAULT_KP;
+            pid.kI = DEFAULT_KI;
+            pid.kD = DEFAULT_KD;
+            pid.learnCoeff = DEFAULT_LEARN_RATE;
             prefs.putFloat("kP", pid.kP);
             prefs.putFloat("kI", pid.kI);
             prefs.putFloat("kD", pid.kD);
