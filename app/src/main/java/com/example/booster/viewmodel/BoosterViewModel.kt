@@ -1,12 +1,18 @@
 package com.example.booster.viewmodel
 
-import androidx.lifecycle.ViewModel
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.booster.ble.BleManager
 import com.example.booster.data.TelemetryData
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import java.io.BufferedWriter
+import java.io.File
+import java.io.FileWriter
+import java.io.OutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
@@ -20,15 +26,12 @@ private data class TripLogRow(
 
 private data class TripLogColumn(val header: String, val value: (TripLogRow) -> String)
 
-private const val MAX_TRIP_LOG_ROWS = 50_000
-
-class BoosterViewModel : ViewModel() {
+class BoosterViewModel(application: Application) : AndroidViewModel(application) {
     private val bleManager = BleManager()
 
     val connectionStatus = bleManager.connectionStatus
     val telemetry = bleManager.telemetry
 
-    private val tripLogRows = ArrayDeque<TripLogRow>()
     private val _tripLogSize = MutableStateFlow(0)
     val tripLogSize = _tripLogSize.asStateFlow()
     private val _diagnosticLog = MutableStateFlow<List<String>>(emptyList())
@@ -39,8 +42,24 @@ class BoosterViewModel : ViewModel() {
     private var lastKlineFrameCount = 0L
     private var lastKlineResponse = ""
 
+    // Streaming trip log (A1): rows are written straight to a file on disk instead of being
+    // accumulated in a List in RAM, so a multi-hour drive can't trigger an OutOfMemoryError,
+    // and export streams the file rather than building one giant String.
+    private val logFile = File(application.cacheDir, "trip_log_current.csv")
+    private val logLock = Any()
+    private var logWriter: BufferedWriter? = null
+    private var headerWritten = false
+    private var logRowCount = 0
+    private var rowsSinceFlush = 0
+
     init {
-        viewModelScope.launch {
+        synchronized(logLock) {
+            runCatching { logWriter = BufferedWriter(FileWriter(logFile, false)) }  // fresh file per app session
+            headerWritten = false
+            logRowCount = 0
+            rowsSinceFlush = 0
+        }
+        viewModelScope.launch(Dispatchers.IO) {
             telemetry.collect { data ->
                 appendDiagnosticLogIfNeeded(data)
                 appendTripLogRowIfNeeded(data)
@@ -116,14 +135,26 @@ class BoosterViewModel : ViewModel() {
         TripLogColumn("last_error") { csvCell(it.telemetry.lastError.orEmpty()) }
     )
 
-    fun exportTripLogCsv(): String = buildString {
-        appendLine(tripLogColumns.joinToString(",") { it.header })
-        tripLogRows.forEach { row ->
-            appendLine(tripLogColumns.joinToString(",") { it.value(row) })
+    // Streams the on-disk log to the chosen destination (no giant in-memory String).
+    // Call off the main thread — copies the file in chunks.
+    fun copyTripLogTo(out: OutputStream) {
+        synchronized(logLock) {
+            runCatching { logWriter?.flush() }
+            rowsSinceFlush = 0
+            if (logFile.exists()) {
+                logFile.inputStream().use { it.copyTo(out) }
+            }
         }
     }
 
     override fun onCleared() {
+        synchronized(logLock) {
+            runCatching {
+                logWriter?.flush()
+                logWriter?.close()
+            }
+            logWriter = null
+        }
         bleManager.release()
         super.onCleared()
     }
@@ -136,19 +167,33 @@ class BoosterViewModel : ViewModel() {
             logSessionStartedAt = telemetryAt
         }
 
-        tripLogRows.addLast(
-            TripLogRow(
-                recordedAtMillis = telemetryAt,
-                sessionMillis = telemetryAt - logSessionStartedAt,
-                connectionStatus = connectionStatus.value,
-                telemetry = data
-            )
+        val row = TripLogRow(
+            recordedAtMillis = telemetryAt,
+            sessionMillis = telemetryAt - logSessionStartedAt,
+            connectionStatus = connectionStatus.value,
+            telemetry = data
         )
-        while (tripLogRows.size > MAX_TRIP_LOG_ROWS) {
-            tripLogRows.removeFirst()
+
+        synchronized(logLock) {
+            val writer = logWriter ?: return
+            runCatching {
+                if (!headerWritten) {
+                    writer.write(tripLogColumns.joinToString(",") { it.header })
+                    writer.newLine()
+                    headerWritten = true
+                }
+                writer.write(tripLogColumns.joinToString(",") { it.value(row) })
+                writer.newLine()
+                logRowCount++
+                if (++rowsSinceFlush >= 100) {   // bound data loss without flushing every line
+                    writer.flush()
+                    rowsSinceFlush = 0
+                }
+            }
         }
+
         lastLoggedTelemetryAt = telemetryAt
-        _tripLogSize.value = tripLogRows.size
+        _tripLogSize.value = logRowCount
     }
 
     private fun appendDiagnosticLogIfNeeded(data: TelemetryData) {

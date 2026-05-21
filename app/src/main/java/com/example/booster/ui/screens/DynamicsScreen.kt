@@ -31,6 +31,7 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -45,7 +46,10 @@ import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.booster.data.AppPreferencesRepository
 import com.example.booster.viewmodel.BoosterViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.text.SimpleDateFormat
@@ -59,19 +63,25 @@ fun DynamicsScreen(viewModel: BoosterViewModel) {
     val data by viewModel.telemetry.collectAsStateWithLifecycle()
     val tripLogSize by viewModel.tripLogSize.collectAsStateWithLifecycle()
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val prefs = remember { AppPreferencesRepository(context) }.dynamicsPrefs
     val saveLogLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("text/csv")
     ) { uri ->
         if (uri == null) return@rememberLauncherForActivityResult
-        runCatching {
-            context.contentResolver.openOutputStream(uri)?.bufferedWriter()?.use { writer ->
-                writer.write(viewModel.exportTripLogCsv())
-            } ?: error("Не удалось открыть файл")
-        }.onSuccess {
-            Toast.makeText(context, "Лог сохранен", Toast.LENGTH_SHORT).show()
-        }.onFailure { error ->
-            Toast.makeText(context, "Не удалось сохранить лог: ${error.message}", Toast.LENGTH_LONG).show()
+        scope.launch(Dispatchers.IO) {
+            val result = runCatching {
+                context.contentResolver.openOutputStream(uri)?.use { out ->
+                    viewModel.copyTripLogTo(out)
+                } ?: error("Не удалось открыть файл")
+            }
+            withContext(Dispatchers.Main) {
+                result.onSuccess {
+                    Toast.makeText(context, "Лог сохранен", Toast.LENGTH_SHORT).show()
+                }.onFailure { error ->
+                    Toast.makeText(context, "Не удалось сохранить лог: ${error.message}", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 

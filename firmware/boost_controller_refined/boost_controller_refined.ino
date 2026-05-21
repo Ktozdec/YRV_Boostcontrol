@@ -43,6 +43,11 @@ constexpr float HARD_LIMP_BOOST_BAR = 1.15f;
 // One place for the knobs that shape boost behaviour and self-learning.
 // (Protection thresholds are SOFT_LIMP_BOOST_BAR / HARD_LIMP_BOOST_BAR above.)
 
+// -- Control loop timing & robustness --
+constexpr uint32_t CONTROL_PERIOD_MS = 10;     // 100 Hz control loop (matched to sensor cadence)
+constexpr int   ADC_FAIL_LIMIT       = 4;      // consecutive ADC failures before forcing limp (~50 ms)
+constexpr uint32_t MAP_SAVE_INTERVAL_MS = 60000; // NVS map flush no more than once per minute (when changed)
+
 // -- PID base gains (also power-on defaults; a saved value in NVS overrides them) --
 constexpr float DEFAULT_KP = 28.0f;
 constexpr float DEFAULT_KI = 16.0f;
@@ -116,7 +121,6 @@ const int klineTxPin = 17;
 
 const int pwmFreq = 30;
 const int pwmRes = 8;
-volatile int activePwmDuty = 0;
 volatile int testDuty = 0;
 volatile float latchedGearBoostTrim = 0.20f;
 
@@ -1046,8 +1050,31 @@ void TaskSensors(void *pvParameters) {
         int16_t r0 = safeReadADS1115(0, 10);
         int16_t r1 = safeReadADS1115(1, 10);
 
-        float rawPIM = (r0 == INT16_MIN) ? 0.0f : (r0 * ADS1115_MULTIPLIER_6V144);
-        float rawVTA = (r1 == INT16_MIN) ? 0.0f : (r1 * ADS1115_MULTIPLIER_6V144);
+        // ADC debounce (F4): a single I2C glitch must not drop us into limp. Ride through
+        // brief failures on the last good reading; only force a fault (0 V → limp) after
+        // ADC_FAIL_LIMIT consecutive misses.
+        static float lastGoodPIM = 2.57f;   // ~atmosphere
+        static float lastGoodVTA = 0.42f;
+        static int adcFailCount = 0;
+
+        float rawPIM;
+        float rawVTA;
+        if (r0 == INT16_MIN || r1 == INT16_MIN) {
+            adcFailCount++;
+            if (adcFailCount >= ADC_FAIL_LIMIT) {
+                rawPIM = 0.0f;   // genuine sensor/bus loss → updateSafety will go HARD_LIMP
+                rawVTA = 0.0f;
+            } else {
+                rawPIM = lastGoodPIM;
+                rawVTA = lastGoodVTA;
+            }
+        } else {
+            adcFailCount = 0;
+            rawPIM = r0 * ADS1115_MULTIPLIER_6V144;
+            rawVTA = r1 * ADS1115_MULTIPLIER_6V144;
+            lastGoodPIM = rawPIM;
+            lastGoodVTA = rawVTA;
+        }
 
         filtered_map_volts = FILTER_OLD * filtered_map_volts + FILTER_NEW * rawPIM;
         float real_boost_bar = (filtered_map_volts - localCfg.offsetPIM) * localCfg.scalePIM;
@@ -1125,7 +1152,9 @@ void TaskSensors(void *pvParameters) {
 void TaskControl(void *pvParameters) {
     (void)pvParameters;
     esp_task_wdt_add(nullptr);
-    uint32_t lastPidTime = millis();
+    uint32_t lastPidMicros = micros();
+    uint32_t lastMeasMicros = micros();
+    bool wasEngineRunning = false;
     SensorData d = {};
 
     for (;;) {
@@ -1138,10 +1167,11 @@ void TaskControl(void *pvParameters) {
         updateSafety(d);
         currentBaseDuty = getMappedBaseDuty2D(d.rpm, d.tps);
 
-        uint32_t now = millis();
-        float dt = (now - lastPidTime) / 1000.0f;
-        if (dt <= 0.001f) dt = 0.05f;
-        lastPidTime = now;
+        // F1: precise loop timing from micros() (unsigned subtraction handles the ~71 min wrap).
+        uint32_t nowUs = micros();
+        float dt = (nowUs - lastPidMicros) / 1000000.0f;
+        if (dt <= 0.0002f || dt > 0.5f) dt = CONTROL_PERIOD_MS / 1000.0f;
+        lastPidMicros = nowUs;
 
         float targetTrim = latchedGearBoostTrim;
         float shapedTarget = localCfg.targetBoost * getTargetShape(d.rpm);
@@ -1167,25 +1197,35 @@ void TaskControl(void *pvParameters) {
             float kiEff = pid.kI * (1.0f + (gainFactor - 1.0f) * 0.5f);
             float kdEff = pid.kD;
 
-            // Derivative-on-measurement: react to boost rate, not setpoint changes (no kick).
-            float measRate = (d.boost - pid.lastMeas) / dt;
-            pid.filteredDerivative = pid.filteredDerivative * 0.65f + (-measRate) * 0.35f;
-            pid.lastMeas = d.boost;
+            // F1: derivative-on-measurement evaluated over the REAL time since the boost reading
+            // actually changed (the control loop runs faster than the sensor, so most cycles see
+            // an unchanged value — recomputing every cycle would inject 0/spike noise).
+            if (d.boost != pid.lastMeas) {
+                float measDt = (nowUs - lastMeasMicros) / 1000000.0f;
+                if (measDt < 0.0005f) measDt = dt;
+                float measRate = (d.boost - pid.lastMeas) / measDt;
+                pid.filteredDerivative = pid.filteredDerivative * 0.65f + (-measRate) * 0.35f;
+                pid.lastMeas = d.boost;
+                lastMeasMicros = nowUs;
+            } else {
+                pid.filteredDerivative *= 0.9f;   // no fresh data → relax the derivative toward 0
+            }
             pid.lastError = err;
-
-            float integralCandidate = pid.integral + err * kiEff * dt;
-            pid.integral = constrainFloat(integralCandidate, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
 
             // Setpoint feed-forward: anticipate a rising target to spool faster (help only, never fight).
             float setpointFF = constrainFloat(targetRate * SETPOINT_FF_GAIN, 0.0f, SETPOINT_FF_CAP);
 
-            float duty = currentBaseDuty + (err * kpEff) + pid.integral + (pid.filteredDerivative * kdEff) + setpointFF;
-            if (d.boost > dynamicTarget + 0.15f) {
-                pid.integral *= 0.90f;
+            // F3: conditional-integration anti-windup. Form the candidate integral, build the
+            // output, and only commit the integral if we are not driving further into saturation.
+            float integralCandidate = constrainFloat(pid.integral + err * kiEff * dt, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+            float dutyUnclamped = currentBaseDuty + (err * kpEff) + integralCandidate + (pid.filteredDerivative * kdEff) + setpointFF;
+            bool pushingIntoHigh = dutyUnclamped > MAP_DUTY_MAX && err > 0.0f;
+            bool pushingIntoLow  = dutyUnclamped < MAP_DUTY_MIN && err < 0.0f;
+            if (!pushingIntoHigh && !pushingIntoLow) {
+                pid.integral = integralCandidate;     // accept; otherwise freeze (no abrupt *0.9 kicks)
             }
-            if (duty > 85.0f || duty < 0.0f) pid.integral *= 0.92f;
 
-            currentOutDuty = constrainFloat(duty, 0.0f, 85.0f);
+            currentOutDuty = constrainFloat(dutyUnclamped, MAP_DUTY_MIN, MAP_DUTY_MAX);
 
             bool pidNotSaturated = currentOutDuty > 6.0f && currentOutDuty < 84.0f;
             if (pidNotSaturated && learningWindowStable(d, err)) {
@@ -1201,50 +1241,35 @@ void TaskControl(void *pvParameters) {
             pid.integral *= 0.90f;
             pid.lastError = 0.0f;
             pid.lastMeas = d.boost;
+            lastMeasMicros = nowUs;
             pid.filteredDerivative = 0.0f;
             currentOutDuty = (systemMode == SOFT_LIMP) ? 20.0f : 0.0f;
         }
 
-        portENTER_CRITICAL(&rpmMux);
-        activePwmDuty = map(static_cast<int>(currentOutDuty), 0, 100, 0, 255);
-        portEXIT_CRITICAL(&rpmMux);
-
-        esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(50));
-    }
-}
-
-void TaskPWM(void *pvParameters) {
-    (void)pvParameters;
-    esp_task_wdt_add(nullptr);
-    int lastPwmValue = -1;
-    SensorData d = {};
-
-    for (;;) {
-        if (takeMutex(dataMutex, pdMS_TO_TICKS(40))) {
-            d = sensors;
-            xSemaphoreGive(dataMutex);
-        }
-
-        int currentActivePwm = 0;
-        portENTER_CRITICAL(&rpmMux);
-        currentActivePwm = activePwmDuty;
-        portEXIT_CRITICAL(&rpmMux);
-
+        // F2: write the solenoid PWM immediately here — no separate TaskPWM, no 0–20 ms dead time.
+        // Manual solenoid test (DUTY:) still overrides while the car is stationary.
         int requestedTestDuty = constrain(static_cast<int>(testDuty), 0, 100);
-        int pwmValue = (d.speed < 2.0f && requestedTestDuty > 0)
+        int pwmByte = (d.speed < 2.0f && requestedTestDuty > 0)
             ? map(requestedTestDuty, 0, 100, 0, 255)
-            : currentActivePwm;
+            : map(static_cast<int>(currentOutDuty), 0, 100, 0, 255);
+        ledcWrite(solPin, pwmByte);
 
-        if (pwmValue != lastPwmValue) {
-            ledcWrite(solPin, pwmValue);
-            lastPwmValue = pwmValue;
+        // F6: when the engine stops, flush the learned map promptly so up to a minute of
+        // adaptation isn't lost (the routine NVS cadence is once per minute, see TaskOdometerAndStorage).
+        bool engineRunning = d.rpm > 300.0f;
+        if (wasEngineRunning && !engineRunning && mapNeedsSaving) {
+            forceMapSaveRequested = true;
+            notifyStorageTask();
         }
+        wasEngineRunning = engineRunning;
 
         esp_task_wdt_reset();
-        vTaskDelay(pdMS_TO_TICKS(20));
+        vTaskDelay(pdMS_TO_TICKS(CONTROL_PERIOD_MS));
     }
 }
+
+// TaskPWM removed (F2): the solenoid is now written directly at the end of TaskControl,
+// eliminating the 0–20 ms actuation dead time.
 
 void TaskTelemetry(void *pvParameters) {
     (void)pvParameters;
@@ -1395,7 +1420,7 @@ void TaskOdometerAndStorage(void *pvParameters) {
             lastSavedHours = stationaryEngineHours;
         }
 
-        if (mapNeedsSaving && (forceMapSaveRequested || (millis() - lastMapSaveMs >= 10000))) {
+        if (mapNeedsSaving && (forceMapSaveRequested || (millis() - lastMapSaveMs >= MAP_SAVE_INTERVAL_MS))) {
             float mapSnapshot[NUM_TPS_BINS][NUM_RPM_BINS];
             float confidenceSnapshot[NUM_TPS_BINS][NUM_RPM_BINS];
             uint16_t samplesSnapshot[NUM_TPS_BINS][NUM_RPM_BINS];
@@ -1623,7 +1648,6 @@ void setup() {
     xTaskCreatePinnedToCore(TaskSensors, "SENS", 4096, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(TaskKLineReader, "KLINE", 3072, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(TaskControl, "CTRL", 4096, nullptr, 2, nullptr, 1);
-    xTaskCreatePinnedToCore(TaskPWM, "PWM", 3072, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(TaskTelemetry, "TELEM", 4096, nullptr, 1, nullptr, 1);
     xTaskCreatePinnedToCore(TaskOdometerAndStorage, "ODO_STOR", 4096, nullptr, 1, nullptr, 0);
 }

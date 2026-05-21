@@ -4,7 +4,8 @@
       "Bash(./gradlew assembleDebug --no-daemon -q)",
       "PowerShell(where.exe java 2>$null; Get-ChildItem \"$env:LOCALAPPDATA\\\\Programs\" -Directory -ErrorAction SilentlyContinue | Select-Object -First 10 Name)",
       "Bash(export JAVA_HOME=\"/c/Program Files/Android/Android Studio/jbr\")",
-      "Bash(export PATH=\"$JAVA_HOME/bin:$PATH\")"
+      "Bash(export PATH=\"$JAVA_HOME/bin:$PATH\")",
+      "Bash(echo \"exit=$?\")"
     ]
   }
 }
