@@ -24,6 +24,7 @@ data class TelemetryData(
     @SerialName("sP") val scaleMap: Float = 0.0f,
     @SerialName("oV") val offsetTps: Float = 0.0f,
     @SerialName("tB") val targetBoost: Float = 0.0f,
+    @SerialName("lB") val limitBoostBar: Float = 0.95f,
     @SerialName("kP") val kP: Float = 0.0f,
     @SerialName("kI") val kI: Float = 0.0f,
     @SerialName("kD") val kD: Float = 0.0f,

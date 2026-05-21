@@ -117,6 +117,8 @@ class BoosterViewModel : ViewModel() {
             append(',')
             append(formatFloat(row.telemetry.targetBoost))
             append(',')
+            append(formatFloat(row.telemetry.limitBoostBar))
+            append(',')
             append(formatFloat(row.telemetry.kP))
             append(',')
             append(formatFloat(row.telemetry.kI))
@@ -173,7 +175,7 @@ class BoosterViewModel : ViewModel() {
         append("recorded_at_ms,session_ms,connection_status")
         append(",boost,min_boost,max_boost,rpm,max_rpm,speed,max_speed,tps,total_distance")
         append(",base_duty,current_duty,mode,pulses_rpm,vss_pulses,offset_map,scale_map,offset_tps")
-        append(",target_boost,kp,ki,kd,learn_coeff,tire_w,tire_a,tire_r,engine_hours,kline_bytes,kline_frames,kline_last_hex,last_ack,last_error")
+        append(",target_boost,limit_boost_bar,kp,ki,kd,learn_coeff,tire_w,tire_a,tire_r,engine_hours,kline_bytes,kline_frames,kline_last_hex,last_ack,last_error")
     }
 
     private fun appendDiagnosticLogIfNeeded(data: TelemetryData) {

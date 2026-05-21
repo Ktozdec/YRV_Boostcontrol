@@ -59,6 +59,14 @@ import java.util.concurrent.TimeUnit
 
 private data class MaintItem(val id: String, val name: String, val defaultKm: Int, val defaultDays: Int)
 
+private data class MaintCalc(
+    val intervalKm: Int,
+    val intervalDays: Int,
+    val remainingKm: Int,
+    val remainingDays: Int,
+    val progress: Float
+)
+
 @Composable
 fun MaintenanceScreen(viewModel: BoosterViewModel) {
     val data by viewModel.telemetry.collectAsStateWithLifecycle()
@@ -66,6 +74,8 @@ fun MaintenanceScreen(viewModel: BoosterViewModel) {
     val prefs = remember { AppPreferencesRepository(context).maintenancePrefs }
 
     var currentMileage by remember { mutableIntStateOf(data.totalDistance.toInt()) }
+    // Bumped after any prefs edit to force the maintenance cards to re-read SharedPreferences.
+    var refreshTick by remember { mutableIntStateOf(0) }
     var showMileageDialog by remember { mutableStateOf(false) }
     var editMileageInput by remember { mutableStateOf("") }
 
@@ -156,21 +166,30 @@ fun MaintenanceScreen(viewModel: BoosterViewModel) {
 
         items(maintItems.size) { index ->
             val item = maintItems[index]
-            val intervalKm = prefs.getInt("${item.id}_interval_km", prefs.getInt("${item.id}_interval", item.defaultKm))
-            val intervalDays = prefs.getInt("${item.id}_interval_days", item.defaultDays)
-            val lastKm = prefs.getInt("${item.id}_last_km", prefs.getInt("${item.id}_last", currentMileage))
-            val lastDateMs = prefs.getLong("${item.id}_last_date", System.currentTimeMillis())
+            // Re-read prefs whenever the odometer or refreshTick changes (prefs themselves
+            // are not observable by Compose, so an explicit key is required).
+            val calc = remember(refreshTick, currentMileage, item.id) {
+                val intervalKm = prefs.getInt("${item.id}_interval_km", prefs.getInt("${item.id}_interval", item.defaultKm))
+                val intervalDays = prefs.getInt("${item.id}_interval_days", item.defaultDays)
+                val lastKm = prefs.getInt("${item.id}_last_km", prefs.getInt("${item.id}_last", currentMileage))
+                val lastDateMs = prefs.getLong("${item.id}_last_date", System.currentTimeMillis())
 
-            val passedKm = (currentMileage - lastKm).coerceAtLeast(0)
-            val passedDays = TimeUnit.MILLISECONDS.toDays(System.currentTimeMillis() - lastDateMs).toInt().coerceAtLeast(0)
-            val remainingKm = (intervalKm - passedKm).coerceAtLeast(0)
-            val remainingDays = (intervalDays - passedDays).coerceAtLeast(0)
-            val kmProgress = (remainingKm.toFloat() / intervalKm.coerceAtLeast(1)).coerceIn(0f, 1f)
-            val dayProgress = (remainingDays.toFloat() / intervalDays.coerceAtLeast(1)).coerceIn(0f, 1f)
-            val progress = minOf(kmProgress, dayProgress)
+                val passedKm = (currentMileage - lastKm).coerceAtLeast(0)
+                val passedDays = TimeUnit.MILLISECONDS.toDays(System.currentTimeMillis() - lastDateMs).toInt().coerceAtLeast(0)
+                val remainingKm = (intervalKm - passedKm).coerceAtLeast(0)
+                val remainingDays = (intervalDays - passedDays).coerceAtLeast(0)
+                val kmProgress = (remainingKm.toFloat() / intervalKm.coerceAtLeast(1)).coerceIn(0f, 1f)
+                val dayProgress = (remainingDays.toFloat() / intervalDays.coerceAtLeast(1)).coerceIn(0f, 1f)
+                MaintCalc(intervalKm, intervalDays, remainingKm, remainingDays, minOf(kmProgress, dayProgress))
+            }
+            val intervalKm = calc.intervalKm
+            val intervalDays = calc.intervalDays
+            val remainingKm = calc.remainingKm
+            val remainingDays = calc.remainingDays
+            val progress = calc.progress
             val progressColor = when {
                 progress > 0.3f -> StatusGreen
-                progress > 0.1f -> Color(0xFFFFC107)
+                progress > 0.1f -> AccentAmber
                 else -> BoostRed
             }
 
@@ -209,8 +228,7 @@ fun MaintenanceScreen(viewModel: BoosterViewModel) {
                                         .putInt("${item.id}_last_km", currentMileage)
                                         .putLong("${item.id}_last_date", System.currentTimeMillis())
                                         .apply()
-                                    currentMileage += 1
-                                    currentMileage -= 1
+                                    refreshTick++
                                     Toast.makeText(context, "${item.name}: интервал сброшен", Toast.LENGTH_SHORT).show()
                                 },
                                 modifier = Modifier.height(32.dp),
@@ -376,8 +394,7 @@ fun MaintenanceScreen(viewModel: BoosterViewModel) {
                             .putInt("${editingIntervalId}_interval_km", km)
                             .putInt("${editingIntervalId}_interval_days", days)
                             .apply()
-                        currentMileage += 1
-                        currentMileage -= 1
+                        refreshTick++
                     }
                     editingIntervalId = null
                 }) {

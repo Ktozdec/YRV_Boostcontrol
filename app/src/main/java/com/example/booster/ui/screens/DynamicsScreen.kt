@@ -19,7 +19,7 @@ import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
-import androidx.compose.material3.Divider
+import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -223,7 +223,7 @@ fun DynamicsScreen(viewModel: BoosterViewModel) {
             color = when {
                 isRunning && telemetryGapDetected -> BoostRed
                 isReadyToStart -> StatusGreen
-                else -> Color(0xFFFFC107)
+                else -> AccentAmber
             },
             fontWeight = FontWeight.Bold,
             letterSpacing = 1.sp
@@ -241,7 +241,7 @@ fun DynamicsScreen(viewModel: BoosterViewModel) {
         }
 
         if (isTelemetryStale) {
-            Text("Скорость давно не обновлялась", color = Color(0xFFFFC107), fontSize = 12.sp)
+            Text("Скорость давно не обновлялась", color = AccentAmber, fontSize = 12.sp)
         }
 
         Spacer(modifier = Modifier.height(32.dp))
@@ -297,7 +297,7 @@ fun DynamicsScreen(viewModel: BoosterViewModel) {
                                 Text("0-100: ${formatTime(run.t100)}", color = NeonWhite)
                             }
                             Text("402м: ${formatTime(run.t402)}", color = StatusGreen, fontWeight = FontWeight.Bold)
-                            Divider(color = Color(0xFF333333), modifier = Modifier.padding(top = 8.dp))
+                            HorizontalDivider(color = Color(0xFF333333), modifier = Modifier.padding(top = 8.dp))
                         }
                     }
                     if (runHistory.isEmpty()) {

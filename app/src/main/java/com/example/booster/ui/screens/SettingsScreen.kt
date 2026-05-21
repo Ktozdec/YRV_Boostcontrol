@@ -1,8 +1,10 @@
-﻿package com.example.booster.ui.screens
+package com.example.booster.ui.screens
 
 import android.widget.Toast
-import androidx.compose.foundation.BorderStroke
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -20,13 +22,17 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -43,6 +49,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
@@ -63,6 +70,7 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
 
     var testDutySlider by remember { mutableFloatStateOf(0f) }
     var draftTb by remember { mutableFloatStateOf(0f) }
+    var draftLb by remember { mutableFloatStateOf(0.95f) }
     var draftKp by remember { mutableFloatStateOf(0f) }
     var draftKi by remember { mutableFloatStateOf(0f) }
     var draftKd by remember { mutableFloatStateOf(0f) }
@@ -75,10 +83,12 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
 
     var isInitialized by remember { mutableStateOf(false) }
     var showOtaDialog by remember { mutableStateOf(false) }
+    var justSaved by remember { mutableStateOf(false) }
 
     LaunchedEffect(data.targetBoost) {
         if (!isInitialized && data.targetBoost != 0f) {
             draftTb = data.targetBoost
+            draftLb = data.limitBoostBar
             draftKp = data.kP
             draftKi = data.kI
             draftKd = data.kD
@@ -99,9 +109,29 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
 
     LaunchedEffect(connectionStatus) {
         if (connectionStatus == "Подключено") {
+            isInitialized = false
             viewModel.sendCommand("GET:SETTINGS")
         }
     }
+
+    LaunchedEffect(justSaved) {
+        if (justSaved) {
+            delay(1400)
+            justSaved = false
+        }
+    }
+
+    val isSettingsLoaded = isInitialized && data.targetBoost != 0f
+
+    val saveButtonColor by animateColorAsState(
+        targetValue = when {
+            justSaved -> StatusGreen
+            isSettingsLoaded -> BoostBlue.copy(alpha = 0.85f)
+            else -> Color(0xFF232323)
+        },
+        animationSpec = tween(300),
+        label = "saveColor"
+    )
 
     LazyColumn(
         modifier = Modifier.fillMaxSize().background(DarkBg).padding(horizontal = 8.dp),
@@ -113,13 +143,15 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                 fontSize = 24.sp,
                 fontWeight = FontWeight.Black,
                 color = NeonWhite,
+                letterSpacing = (-0.5).sp,
                 modifier = Modifier.padding(bottom = 16.dp)
             )
         }
 
         item {
-            SettingsCard(title = "Target Boost (Бар)") {
-                TuneRow("Целевой наддув", draftTb, 0.05f, "%.2f", 0.3f, 1.5f) { draftTb = it }
+            SettingsCard(title = "Target Boost / FCD") {
+                TuneRow("Целевой наддув (бар)", draftTb, 0.05f, "%.2f", 0.3f, 1.5f) { draftTb = it }
+                TuneRow("Лимит FCD (бар)", draftLb, 0.05f, "%.2f", 0.3f, 2.0f) { draftLb = it }
             }
         }
 
@@ -138,7 +170,7 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                 TuneRow("Множ. MAP (sP)", draftSp, 0.01f, "%.2f", 0.1f, 2.0f) { draftSp = it }
                 TuneRow("Ноль TPS (oV)", draftOv, 0.01f, "%.2f", 0.1f, 3.5f) { draftOv = it }
                 Spacer(Modifier.height(16.dp))
-                Text("Датчики вращения:", color = TextGray, fontSize = 12.sp)
+                Text("Датчики вращения:", color = TextGray, fontSize = 12.sp, letterSpacing = 0.5.sp)
                 TuneRow("Зубья ДПКВ (pR)", draftPr, 0.5f, "%.1f", 0.5f, 8.0f) { draftPr = it }
                 TuneRow("Имп. скорости (vP)", draftVp, 0.1f, "%.2f", 1.0f, 40.0f) { draftVp = it }
             }
@@ -147,7 +179,7 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         if (data.mode != 0) {
             item {
                 val modeText = if (data.mode == 1) "SOFT LIMP" else "HARD LIMP"
-                val modeColor = if (data.mode == 1) Color(0xFFFFC107) else BoostRed
+                val modeColor = if (data.mode == 1) AccentAmber else BoostRed
                 SettingsCard(title = "Статус защиты") {
                     Text(
                         "ЭБУ сейчас в режиме $modeText. На время настройки проверь датчики, калибровки и фактический буст.",
@@ -160,7 +192,6 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         }
 
         item {
-            val isSettingsLoaded = isInitialized && data.targetBoost != 0f
             Button(
                 onClick = {
                     if (!isSettingsLoaded) {
@@ -169,44 +200,54 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                     }
                     scope.launch {
                         viewModel.sendCommand("SET:tB:${fmt(clampValue(draftTb, 0.3f, 1.5f), "%.2f")}")
-                        delay(90)
+                        delay(30)
+                        viewModel.sendCommand("SET:lB:${fmt(clampValue(draftLb, 0.3f, 2.0f), "%.2f")}")
+                        delay(30)
                         viewModel.sendCommand("SET:kP:${fmt(clampValue(draftKp, 0f, 200f), "%.1f")}")
-                        delay(90)
+                        delay(30)
                         viewModel.sendCommand("SET:kI:${fmt(clampValue(draftKi, 0f, 200f), "%.1f")}")
-                        delay(90)
+                        delay(30)
                         viewModel.sendCommand("SET:kD:${fmt(clampValue(draftKd, 0f, 50f), "%.1f")}")
-                        delay(90)
+                        delay(30)
                         viewModel.sendCommand("SET:lA:${fmt(clampValue(draftLa, 0.005f, 0.15f), "%.3f")}")
-                        delay(90)
+                        delay(30)
                         viewModel.sendCommand("SET:oP:${fmt(clampValue(draftOp, 0.1f, 4.5f), "%.2f")}")
-                        delay(90)
+                        delay(30)
                         viewModel.sendCommand("SET:sP:${fmt(clampValue(draftSp, 0.1f, 2.0f), "%.2f")}")
-                        delay(90)
+                        delay(30)
                         viewModel.sendCommand("SET:oV:${fmt(clampValue(draftOv, 0.1f, 3.5f), "%.2f")}")
-                        delay(90)
+                        delay(30)
                         viewModel.sendCommand("SET:pR:${fmt(clampValue(draftPr, 0.5f, 8.0f), "%.1f")}")
-                        delay(90)
+                        delay(30)
                         viewModel.sendCommand("SET:vP:${fmt(clampValue(draftVp, 1.0f, 40.0f), "%.2f")}")
-                        delay(120)
+                        delay(30)
                         viewModel.sendCommand("SAVE")
-                        Toast.makeText(context, "Настройки сохранены без карты", Toast.LENGTH_SHORT).show()
+                        Toast.makeText(context, "Настройки сохранены", Toast.LENGTH_SHORT).show()
+                        justSaved = true
                     }
                 },
-                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(64.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = if (isSettingsLoaded) StatusGreen else Color.DarkGray)
+                modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(60.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = saveButtonColor)
             ) {
                 Text(
-                    "СОХРАНИТЬ",
+                    if (justSaved) "СОХРАНЕНО" else "СОХРАНИТЬ",
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
-                    color = if (isSettingsLoaded) NeonWhite else TextGray
+                    letterSpacing = 1.sp,
+                    color = if (isSettingsLoaded || justSaved) NeonWhite else TextGray
                 )
             }
         }
 
         item {
             SettingsCard(title = "Сервисные функции") {
-                Text("ТЕСТ СОЛЕНОИДА: ${testDutySlider.toInt()}%", fontWeight = FontWeight.Bold, color = NeonWhite)
+                Text(
+                    "ТЕСТ СОЛЕНОИДА: ${testDutySlider.toInt()}%",
+                    fontWeight = FontWeight.Bold,
+                    color = NeonWhite,
+                    fontFamily = FontFamily.Monospace
+                )
                 Slider(
                     value = testDutySlider,
                     onValueChange = { testDutySlider = it.coerceIn(0f, 100f) },
@@ -214,26 +255,31 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                     valueRange = 0f..100f,
                     enabled = data.speed < 2
                 )
-
-                Spacer(Modifier.height(16.dp))
-                Text("Live Base Duty: ${data.baseDuty}% | Live Out Duty: ${data.currentDuty}%", color = TextGray, fontSize = 12.sp)
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "База: ${data.baseDuty}%  |  Выход: ${data.currentDuty}%",
+                    color = TextGray,
+                    fontSize = 12.sp,
+                    fontFamily = FontFamily.Monospace
+                )
                 Spacer(Modifier.height(16.dp))
 
                 Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(
                         onClick = { showOtaDialog = true },
                         modifier = Modifier.weight(1f).height(48.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFD32F2F))
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = BoostRed.copy(alpha = 0.85f))
                     ) {
-                        Text("OTA РЕЖИМ", fontSize = 12.sp, color = NeonWhite)
+                        Text("OTA РЕЖИМ", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = NeonWhite)
                     }
-
                     Button(
                         onClick = { viewModel.disconnect() },
                         modifier = Modifier.weight(1f).height(48.dp),
-                        colors = ButtonDefaults.buttonColors(containerColor = Color.DarkGray)
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2C2C2E))
                     ) {
-                        Text("ОТКЛЮЧИТЬ", fontSize = 12.sp, color = NeonWhite)
+                        Text("ОТКЛЮЧИТЬ", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = TextGray)
                     }
                 }
             }
@@ -247,7 +293,7 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
             title = { Text("Обновление прошивки (OTA)", color = NeonWhite) },
             text = {
                 Text(
-                    "Внимание!\n\n1. Соединение будет разорвано.\n2. Подключитесь к Wi‑Fi сети 'YRV_Boost_Pro'.\n3. Откройте в браузере http://192.168.4.1\n4. Выберите .bin файл для загрузки.",
+                    "Внимание!\n\n1. Соединение будет разорвано.\n2. Подключитесь к Wi-Fi сети 'YRV_Boost_Pro'.\n3. Откройте в браузере http://192.168.4.1\n4. Выберите .bin файл для загрузки.",
                     color = TextGray
                 )
             },
@@ -272,13 +318,20 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
 @Composable
 fun SettingsCard(title: String, content: @Composable ColumnScope.() -> Unit) {
     Card(
-        modifier = Modifier.fillMaxWidth().padding(bottom = 12.dp),
-        elevation = CardDefaults.cardElevation(defaultElevation = 2.dp),
+        modifier = Modifier.fillMaxWidth().padding(bottom = 10.dp),
+        elevation = CardDefaults.cardElevation(defaultElevation = 0.dp),
+        shape = RoundedCornerShape(16.dp),
         colors = CardDefaults.cardColors(containerColor = TrackBg)
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            Text(title, fontSize = 16.sp, fontWeight = FontWeight.Bold, color = NeonWhite)
-            Spacer(Modifier.height(12.dp))
+            Text(
+                title,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Bold,
+                color = NeonWhite,
+                letterSpacing = 0.2.sp
+            )
+            Spacer(Modifier.height(14.dp))
             content()
         }
     }
@@ -297,22 +350,35 @@ fun TuneRow(
     var textValue by remember(value) { mutableStateOf(String.format(Locale.US, format, value)) }
 
     Row(
-        modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp),
+        modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
         horizontalArrangement = Arrangement.SpaceBetween,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        Text(label, modifier = Modifier.weight(1f), fontSize = 16.sp, color = NeonWhite)
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(
+        Text(label, modifier = Modifier.weight(1f), fontSize = 14.sp, color = NeonWhite)
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            IconButton(
                 onClick = { onValueChange(clampValue(value - step, minValue, maxValue)) },
-                modifier = Modifier.size(40.dp),
-                contentPadding = PaddingValues(0.dp),
-                shape = MaterialTheme.shapes.small
+                modifier = Modifier
+                    .size(36.dp)
+                    .background(DarkBg, RoundedCornerShape(8.dp))
+                    .border(1.dp, Color(0xFF3A3A3C), RoundedCornerShape(8.dp))
             ) {
-                Text("-", fontSize = 20.sp, color = NeonWhite)
+                Icon(
+                    imageVector = Icons.Filled.Remove,
+                    contentDescription = null,
+                    tint = NeonWhite,
+                    modifier = Modifier.size(16.dp)
+                )
             }
             Box(
-                modifier = Modifier.width(80.dp).padding(horizontal = 8.dp).background(DarkBg, MaterialTheme.shapes.small).padding(vertical = 8.dp),
+                modifier = Modifier
+                    .width(76.dp)
+                    .background(DarkBg, RoundedCornerShape(8.dp))
+                    .border(1.dp, Color(0xFF3A3A3C), RoundedCornerShape(8.dp))
+                    .padding(vertical = 9.dp, horizontal = 4.dp),
                 contentAlignment = Alignment.Center
             ) {
                 BasicTextField(
@@ -324,17 +390,29 @@ fun TuneRow(
                         }
                     },
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal),
-                    textStyle = TextStyle(textAlign = TextAlign.Center, fontWeight = FontWeight.Bold, color = NeonWhite),
+                    textStyle = TextStyle(
+                        textAlign = TextAlign.Center,
+                        fontWeight = FontWeight.SemiBold,
+                        color = NeonWhite,
+                        fontSize = 14.sp,
+                        fontFamily = FontFamily.Monospace
+                    ),
                     singleLine = true
                 )
             }
-            OutlinedButton(
+            IconButton(
                 onClick = { onValueChange(clampValue(value + step, minValue, maxValue)) },
-                modifier = Modifier.size(40.dp),
-                contentPadding = PaddingValues(0.dp),
-                shape = MaterialTheme.shapes.small
+                modifier = Modifier
+                    .size(36.dp)
+                    .background(DarkBg, RoundedCornerShape(8.dp))
+                    .border(1.dp, Color(0xFF3A3A3C), RoundedCornerShape(8.dp))
             ) {
-                Text("+", fontSize = 20.sp, color = NeonWhite)
+                Icon(
+                    imageVector = Icons.Filled.Add,
+                    contentDescription = null,
+                    tint = NeonWhite,
+                    modifier = Modifier.size(16.dp)
+                )
             }
         }
     }

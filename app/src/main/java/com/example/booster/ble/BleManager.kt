@@ -13,6 +13,8 @@ import com.juul.kable.peripheral
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -32,7 +34,7 @@ class BleManager {
     private val txCharacteristic = characteristicOf(serviceUuid, "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
 
     private val scanner = Scanner { filters = listOf(Filter.Name("YRV_Boost_BLE")) }
-    private val scope = CoroutineScope(Dispatchers.IO + Job())
+    private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val writeMutex = Mutex()
 
     private var peripheral: Peripheral? = null
@@ -136,6 +138,7 @@ class BleManager {
                                     scaleMap = json.optDouble("sP", current.scaleMap.toDouble()).toFloat(),
                                     offsetTps = json.optDouble("oV", current.offsetTps.toDouble()).toFloat(),
                                     targetBoost = json.optDouble("tB", current.targetBoost.toDouble()).toFloat(),
+                                    limitBoostBar = json.optDouble("lB", current.limitBoostBar.toDouble()).toFloat(),
                                     kP = json.optDouble("kP", current.kP.toDouble()).toFloat(),
                                     kI = json.optDouble("kI", current.kI.toDouble()).toFloat(),
                                     kD = json.optDouble("kD", current.kD.toDouble()).toFloat(),
@@ -210,7 +213,7 @@ class BleManager {
                 try {
                     currentPeripheral.write(rxCharacteristic, command.toByteArray(), WriteType.WithResponse)
                     Log.d("BLE", "Отправлено: $command")
-                    delay(50)
+                    delay(20)
                 } catch (e: Exception) {
                     Log.e("BLE", "Ошибка отправки команды: $command", e)
                 }
@@ -234,9 +237,15 @@ class BleManager {
         connectionJob?.cancel()
         telemetryJob?.cancel()
         scope.launch {
-            peripheral?.disconnect()
-            peripheral = null
-            _connectionStatus.value = "Отключено"
+            try {
+                peripheral?.disconnect()
+            } catch (e: Exception) {
+                Log.w("BLE", "Ошибка при освобождении: ${e.message}")
+            } finally {
+                peripheral = null
+                _connectionStatus.value = "Отключено"
+                scope.cancel()
+            }
         }
     }
 }

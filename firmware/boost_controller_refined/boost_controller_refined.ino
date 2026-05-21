@@ -9,6 +9,8 @@
 #include <BLEServer.h>
 #include <BLEUtils.h>
 #include <BLE2902.h>
+#include <Adafruit_MCP4725.h>
+#include "esp_gap_ble_api.h"
 #include "driver/pcnt.h"
 #include "esp_task_wdt.h"
 #include "esp_system.h"
@@ -37,10 +39,20 @@ constexpr uint16_t ADS1115_CFG_BASE =
 constexpr float SOFT_LIMP_BOOST_BAR = 1.05f;
 constexpr float HARD_LIMP_BOOST_BAR = 1.15f;
 
+const float ATMOS_MIN_VOLTS    = 2.40f;
+const float ATMOS_MAX_VOLTS    = 2.70f;
+const float DEFAULT_OFFSET     = 2.57f;
+const float DAC_REFERENCE_VOLTAGE = 5.02f;
+
+const float FILTER_NEW = 0.70f;
+const float FILTER_OLD = 0.30f;
+float filtered_map_volts = 0.0f;
+
 const char *ssid = "YRV_Boost_Pro";
 const char *password = "";
 
 Adafruit_ADS1115 ads;
+Adafruit_MCP4725 dac;
 WebServer server(80);
 Preferences prefs;
 
@@ -83,6 +95,7 @@ struct RuntimeConfig {
     float pulsesPerRev = 2.0f;
     float offsetVTA = 0.35f;
     float targetBoost = 0.80f;
+    float limitBoostBar = 0.95f;
     float vssPulsesPerRev = 5.18f;
     int tireW = 195;
     int tireA = 55;
@@ -684,6 +697,9 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
             cfg.tireR = iValue;
             calcWheelSizeLocked();
         }
+    } else if (key == "lB") {
+        ok = parseFloatStrict(rawValue, 0.3f, 2.0f, fValue);
+        if (ok) cfg.limitBoostBar = fValue;
     } else {
         ok = false;
         error = "unknown_key";
@@ -697,10 +713,19 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
 }
 
 class MyServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer *server) override {
+    void onConnect(BLEServer *server, esp_ble_gatts_cb_param_t *param) override {
         (void)server;
         deviceConnected = true;
         sendSettingsRequested = true;
+        // Request fast connection interval immediately after pairing:
+        // min=12*1.25ms=15ms, max=24*1.25ms=30ms, latency=0, timeout=400*10ms=4s
+        esp_ble_conn_update_params_t connParams = {};
+        memcpy(connParams.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
+        connParams.min_int = 12;
+        connParams.max_int = 24;
+        connParams.latency = 0;
+        connParams.timeout = 400;
+        esp_ble_gap_update_conn_params(&connParams);
     }
 
     void onDisconnect(BLEServer *server) override {
@@ -941,7 +966,15 @@ void TaskSensors(void *pvParameters) {
         float rawPIM = (r0 == INT16_MIN) ? 0.0f : (r0 * ADS1115_MULTIPLIER_6V144);
         float rawVTA = (r1 == INT16_MIN) ? 0.0f : (r1 * ADS1115_MULTIPLIER_6V144);
 
-        float boostRaw = constrainFloat((rawPIM - localCfg.offsetPIM) * localCfg.scalePIM, -1.0f, 2.0f);
+        filtered_map_volts = FILTER_OLD * filtered_map_volts + FILTER_NEW * rawPIM;
+        float real_boost_bar = (filtered_map_volts - localCfg.offsetPIM) * localCfg.scalePIM;
+
+        float ecu_boost_bar = min(real_boost_bar, localCfg.limitBoostBar);
+        float out_volts = (ecu_boost_bar / localCfg.scalePIM) + localCfg.offsetPIM;
+        out_volts = constrainFloat(out_volts, 0.0f, DAC_REFERENCE_VOLTAGE);
+        uint16_t dac_value = (uint16_t)((out_volts / DAC_REFERENCE_VOLTAGE) * 4095.0f);
+        dac.setVoltage(dac_value, false);
+
         float tpsSpan = max(0.3f, 3.71f - localCfg.offsetVTA);
         float tpsRaw = constrainFloat((rawVTA - localCfg.offsetVTA) / tpsSpan * 100.0f, 0.0f, 100.0f);
 
@@ -989,7 +1022,7 @@ void TaskSensors(void *pvParameters) {
         if (takeMutex(dataMutex, pdMS_TO_TICKS(40))) {
             sensors.rawPIM = rawPIM;
             sensors.rawVTA = rawVTA;
-            sensors.boost = sensors.boost * 0.50f + boostRaw * 0.50f;
+            sensors.boost = constrainFloat(real_boost_bar, -1.0f, 2.0f);
             sensors.tps = sensors.tps * 0.60f + tpsRaw * 0.40f;
             sensors.rpm = sensors.rpm * 0.40f + medRPM * 0.60f;
             sensors.speed = smoothedSpeed;
@@ -1146,9 +1179,9 @@ void TaskTelemetry(void *pvParameters) {
                 RuntimeConfig localCfg = snapshotConfig();
 
                 snprintf(bleBuffer, sizeof(bleBuffer),
-                    "{\"S\":1,\"pR\":%.1f,\"oP\":%.2f,\"sP\":%.2f,\"oV\":%.2f,\"tB\":%.2f,\"kP\":%.1f,\"kI\":%.1f,\"kD\":%.1f,\"tW\":%d,\"tA\":%d,\"tR\":%d,\"eH\":%.2f,\"vP\":%.2f,\"lA\":%.3f}\n",
+                    "{\"S\":1,\"pR\":%.1f,\"oP\":%.2f,\"sP\":%.2f,\"oV\":%.2f,\"tB\":%.2f,\"lB\":%.2f,\"kP\":%.1f,\"kI\":%.1f,\"kD\":%.1f,\"tW\":%d,\"tA\":%d,\"tR\":%d,\"eH\":%.2f,\"vP\":%.2f,\"lA\":%.3f}\n",
                     localCfg.pulsesPerRev, localCfg.offsetPIM, localCfg.scalePIM, localCfg.offsetVTA,
-                    localCfg.targetBoost, pid.kP, pid.kI, pid.kD,
+                    localCfg.targetBoost, localCfg.limitBoostBar, pid.kP, pid.kI, pid.kD,
                     localCfg.tireW, localCfg.tireA, localCfg.tireR,
                     stationaryEngineHours, localCfg.vssPulsesPerRev, pid.learnCoeff
                 );
@@ -1244,6 +1277,7 @@ void TaskOdometerAndStorage(void *pvParameters) {
                 prefs.putInt("tW", cfg.tireW);
                 prefs.putInt("tA", cfg.tireA);
                 prefs.putInt("tR", cfg.tireR);
+                prefs.putFloat("lB", cfg.limitBoostBar);
                 xSemaphoreGive(configMutex);
                 settingsNeedsSaving = false;
                 forceSettingsSaveRequested = false;
@@ -1378,6 +1412,7 @@ void setup() {
         cfg.tireW = constrain(prefs.getInt("tW", 195), 100, 300);
         cfg.tireA = constrain(prefs.getInt("tA", 55), 20, 100);
         cfg.tireR = constrain(prefs.getInt("tR", 15), 10, 24);
+        cfg.limitBoostBar = constrainFloat(prefs.getFloat("lB", 0.95f), 0.3f, 2.0f);
         calcWheelSizeLocked();
         pid.kP = constrainFloat(prefs.getFloat("kP", 24.0f), 0.0f, 200.0f);
         pid.kI = constrainFloat(prefs.getFloat("kI", 12.0f), 0.0f, 200.0f);
@@ -1410,6 +1445,26 @@ void setup() {
     ads.setGain(GAIN_TWOTHIRDS);
     ads.setDataRate(RATE_ADS1115_860SPS);
 
+    dac.begin(0x62);
+
+    {
+        float sumVolts = 0.0f;
+        for (int i = 0; i < 10; i++) {
+            int16_t raw = ads.readADC_SingleEnded(0);
+            sumVolts += raw * 0.0001875f;
+            delay(5);
+        }
+        float avgVolts = sumVolts / 10.0f;
+        if (avgVolts >= ATMOS_MIN_VOLTS && avgVolts <= ATMOS_MAX_VOLTS) {
+            cfg.offsetPIM = avgVolts;
+            Serial.printf("Auto-Zero: offset=%.3fV (calibrated)\n", cfg.offsetPIM);
+        } else {
+            cfg.offsetPIM = DEFAULT_OFFSET;
+            Serial.printf("Auto-Zero: offset=%.3fV (default, avg=%.3fV)\n", cfg.offsetPIM, avgVolts);
+        }
+        filtered_map_volts = cfg.offsetPIM;
+    }
+
     pinMode(rpmPin, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(rpmPin), handleRPM, FALLING);
     initPCNT();
@@ -1439,10 +1494,12 @@ void setup() {
     BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
     pAdvertising->addServiceUUID(SERVICE_UUID);
     pAdvertising->setScanResponse(true);
-    pAdvertising->setMinPreferred(0x06);
-    pAdvertising->setMinPreferred(0x12);
-    pAdvertising->setMinInterval(160);
-    pAdvertising->setMaxInterval(320);
+    // Preferred connection interval hint in GAP data: 15ms–30ms
+    pAdvertising->setMinPreferred(0x0C);  // 12 * 1.25ms = 15ms
+    pAdvertising->setMaxPreferred(0x18);  // 24 * 1.25ms = 30ms
+    // Advertising interval: 20ms–40ms for fast phone discovery
+    pAdvertising->setMinInterval(32);     // 32 * 0.625ms = 20ms
+    pAdvertising->setMaxInterval(64);     // 64 * 0.625ms = 40ms
     pAdvertising->start();
 
     xTaskCreatePinnedToCore(TaskSensors, "SENS", 4096, nullptr, 2, nullptr, 0);

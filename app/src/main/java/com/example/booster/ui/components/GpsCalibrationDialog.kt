@@ -90,12 +90,13 @@ fun GpsCalibrationDialog(
         onDispose { fusedLocationClient.removeLocationUpdates(locationCallback) }
     }
 
-    val ratio = if (gpsSpeed > 5f && telemetry.speed > 0) {
+    val canCalibrate = gpsSpeed > 10f && telemetry.speed > 10
+    val ratio = if (canCalibrate) {
         telemetry.speed.toFloat() / gpsSpeed
     } else {
         1f
     }
-    val newGpsVp = telemetry.vssPulses * ratio
+    val newGpsVp = (telemetry.vssPulses * ratio).coerceIn(1.0f, 40.0f)
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -143,7 +144,7 @@ fun GpsCalibrationDialog(
                 )
                 Text(
                     "Расчетный vP: ${String.format(Locale.US, "%.2f", newGpsVp)}",
-                    color = if (gpsSpeed > 5f) NeonWhite else TextGray,
+                    color = if (canCalibrate) NeonWhite else TextGray,
                     fontWeight = FontWeight.Bold
                 )
             }
@@ -151,11 +152,11 @@ fun GpsCalibrationDialog(
         confirmButton = {
             TextButton(
                 onClick = { onApply(newGpsVp) },
-                enabled = telemetry.vssPulses > 0f && gpsSpeed > 5f
+                enabled = canCalibrate && telemetry.vssPulses > 0f
             ) {
                 Text(
                     "ПРИМЕНИТЬ",
-                    color = if (gpsSpeed > 5f) StatusGreen else TextGray,
+                    color = if (canCalibrate) StatusGreen else TextGray,
                     fontWeight = FontWeight.Bold
                 )
             }
