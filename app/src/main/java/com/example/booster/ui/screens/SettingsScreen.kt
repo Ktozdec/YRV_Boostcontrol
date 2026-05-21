@@ -70,7 +70,6 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
 
     var testDutySlider by remember { mutableFloatStateOf(0f) }
     var draftTb by remember { mutableFloatStateOf(0f) }
-    var draftLb by remember { mutableFloatStateOf(0.95f) }
     var draftKp by remember { mutableFloatStateOf(0f) }
     var draftKi by remember { mutableFloatStateOf(0f) }
     var draftKd by remember { mutableFloatStateOf(0f) }
@@ -88,7 +87,6 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
     LaunchedEffect(data.targetBoost) {
         if (!isInitialized && data.targetBoost != 0f) {
             draftTb = data.targetBoost
-            draftLb = data.limitBoostBar
             draftKp = data.kP
             draftKi = data.kI
             draftKd = data.kD
@@ -151,7 +149,16 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         item {
             SettingsCard(title = "Target Boost / FCD") {
                 TuneRow("Целевой наддув (бар)", draftTb, 0.05f, "%.2f", 0.3f, 1.5f) { draftTb = it }
-                TuneRow("Лимит FCD (бар)", draftLb, 0.05f, "%.2f", 0.3f, 2.0f) { draftLb = it }
+                ReadOnlyRow(
+                    label = "Лимит FCD (бар)",
+                    value = String.format(Locale.US, "%.2f", data.limitBoostBar)
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "FCD загружается из прошивки ЭБУ и здесь не редактируется.",
+                    color = TextGray,
+                    fontSize = 11.sp
+                )
             }
         }
 
@@ -160,7 +167,7 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                 TuneRow("Proportional (kP)", draftKp, 1.0f, "%.1f", 0f, 200f) { draftKp = it }
                 TuneRow("Integral (kI)", draftKi, 1.0f, "%.1f", 0f, 200f) { draftKi = it }
                 TuneRow("Derivative (kD)", draftKd, 1.0f, "%.1f", 0f, 50f) { draftKd = it }
-                TuneRow("Скорость обучения (lA)", draftLa, 0.005f, "%.3f", 0.005f, 0.15f) { draftLa = it }
+                TuneRow("Скорость адаптации карты (lA)", draftLa, 0.01f, "%.2f", 0.02f, 0.30f) { draftLa = it }
             }
         }
 
@@ -201,15 +208,13 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                     scope.launch {
                         viewModel.sendCommand("SET:tB:${fmt(clampValue(draftTb, 0.3f, 1.5f), "%.2f")}")
                         delay(30)
-                        viewModel.sendCommand("SET:lB:${fmt(clampValue(draftLb, 0.3f, 2.0f), "%.2f")}")
-                        delay(30)
                         viewModel.sendCommand("SET:kP:${fmt(clampValue(draftKp, 0f, 200f), "%.1f")}")
                         delay(30)
                         viewModel.sendCommand("SET:kI:${fmt(clampValue(draftKi, 0f, 200f), "%.1f")}")
                         delay(30)
                         viewModel.sendCommand("SET:kD:${fmt(clampValue(draftKd, 0f, 50f), "%.1f")}")
                         delay(30)
-                        viewModel.sendCommand("SET:lA:${fmt(clampValue(draftLa, 0.005f, 0.15f), "%.3f")}")
+                        viewModel.sendCommand("SET:lA:${fmt(clampValue(draftLa, 0.02f, 0.30f), "%.2f")}")
                         delay(30)
                         viewModel.sendCommand("SET:oP:${fmt(clampValue(draftOp, 0.1f, 4.5f), "%.2f")}")
                         delay(30)
@@ -334,6 +339,24 @@ fun SettingsCard(title: String, content: @Composable ColumnScope.() -> Unit) {
             Spacer(Modifier.height(14.dp))
             content()
         }
+    }
+}
+
+@Composable
+fun ReadOnlyRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, modifier = Modifier.weight(1f), fontSize = 14.sp, color = NeonWhite)
+        Text(
+            value,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            color = TextGray,
+            fontFamily = FontFamily.Monospace
+        )
     }
 }
 

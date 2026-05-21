@@ -18,13 +18,17 @@ private data class TripLogRow(
     val telemetry: TelemetryData
 )
 
+private data class TripLogColumn(val header: String, val value: (TripLogRow) -> String)
+
+private const val MAX_TRIP_LOG_ROWS = 50_000
+
 class BoosterViewModel : ViewModel() {
     private val bleManager = BleManager()
 
     val connectionStatus = bleManager.connectionStatus
     val telemetry = bleManager.telemetry
 
-    private val tripLogRows = mutableListOf<TripLogRow>()
+    private val tripLogRows = ArrayDeque<TripLogRow>()
     private val _tripLogSize = MutableStateFlow(0)
     val tripLogSize = _tripLogSize.asStateFlow()
     private val _diagnosticLog = MutableStateFlow<List<String>>(emptyList())
@@ -72,79 +76,50 @@ class BoosterViewModel : ViewModel() {
         return "booster_trip_log_${formatter.format(Date())}.csv"
     }
 
+    // Single source of truth for CSV layout: header text and value extractor live together,
+    // so columns and values can never drift out of order.
+    private val tripLogColumns: List<TripLogColumn> = listOf(
+        TripLogColumn("recorded_at_ms") { it.recordedAtMillis.toString() },
+        TripLogColumn("session_ms") { it.sessionMillis.toString() },
+        TripLogColumn("connection_status") { csvCell(it.connectionStatus) },
+        TripLogColumn("boost") { formatFloat(it.telemetry.boost) },
+        TripLogColumn("min_boost") { formatFloat(it.telemetry.minBoost) },
+        TripLogColumn("max_boost") { formatFloat(it.telemetry.maxBoost) },
+        TripLogColumn("rpm") { it.telemetry.rpm.toString() },
+        TripLogColumn("max_rpm") { it.telemetry.maxRpm.toString() },
+        TripLogColumn("speed") { it.telemetry.speed.toString() },
+        TripLogColumn("max_speed") { it.telemetry.maxSpeed.toString() },
+        TripLogColumn("tps") { it.telemetry.tps.toString() },
+        TripLogColumn("total_distance") { formatFloat(it.telemetry.totalDistance) },
+        TripLogColumn("base_duty") { formatFloat(it.telemetry.baseDuty) },
+        TripLogColumn("current_duty") { formatFloat(it.telemetry.currentDuty) },
+        TripLogColumn("mode") { it.telemetry.mode.toString() },
+        TripLogColumn("pulses_rpm") { formatFloat(it.telemetry.pulsesRpm) },
+        TripLogColumn("vss_pulses") { formatFloat(it.telemetry.vssPulses) },
+        TripLogColumn("offset_map") { formatFloat(it.telemetry.offsetMap) },
+        TripLogColumn("scale_map") { formatFloat(it.telemetry.scaleMap) },
+        TripLogColumn("offset_tps") { formatFloat(it.telemetry.offsetTps) },
+        TripLogColumn("target_boost") { formatFloat(it.telemetry.targetBoost) },
+        TripLogColumn("limit_boost_bar") { formatFloat(it.telemetry.limitBoostBar) },
+        TripLogColumn("kp") { formatFloat(it.telemetry.kP) },
+        TripLogColumn("ki") { formatFloat(it.telemetry.kI) },
+        TripLogColumn("kd") { formatFloat(it.telemetry.kD) },
+        TripLogColumn("learn_coeff") { formatFloat(it.telemetry.learnCoeff) },
+        TripLogColumn("tire_w") { it.telemetry.tireW.toString() },
+        TripLogColumn("tire_a") { it.telemetry.tireA.toString() },
+        TripLogColumn("tire_r") { it.telemetry.tireR.toString() },
+        TripLogColumn("engine_hours") { formatFloat(it.telemetry.engineHours) },
+        TripLogColumn("kline_bytes") { it.telemetry.klineBytes.toString() },
+        TripLogColumn("kline_frames") { it.telemetry.klineFrames.toString() },
+        TripLogColumn("kline_last_hex") { csvCell(it.telemetry.klineLastHex) },
+        TripLogColumn("last_ack") { csvCell(it.telemetry.lastAck.orEmpty()) },
+        TripLogColumn("last_error") { csvCell(it.telemetry.lastError.orEmpty()) }
+    )
+
     fun exportTripLogCsv(): String = buildString {
-        appendLine(buildHeader())
+        appendLine(tripLogColumns.joinToString(",") { it.header })
         tripLogRows.forEach { row ->
-            append(row.recordedAtMillis)
-            append(',')
-            append(row.sessionMillis)
-            append(',')
-            append(csvCell(row.connectionStatus))
-            append(',')
-            append(formatFloat(row.telemetry.boost))
-            append(',')
-            append(formatFloat(row.telemetry.minBoost))
-            append(',')
-            append(formatFloat(row.telemetry.maxBoost))
-            append(',')
-            append(row.telemetry.rpm)
-            append(',')
-            append(row.telemetry.maxRpm)
-            append(',')
-            append(row.telemetry.speed)
-            append(',')
-            append(row.telemetry.maxSpeed)
-            append(',')
-            append(row.telemetry.tps)
-            append(',')
-            append(formatFloat(row.telemetry.totalDistance))
-            append(',')
-            append(formatFloat(row.telemetry.baseDuty))
-            append(',')
-            append(formatFloat(row.telemetry.currentDuty))
-            append(',')
-            append(row.telemetry.mode)
-            append(',')
-            append(formatFloat(row.telemetry.pulsesRpm))
-            append(',')
-            append(formatFloat(row.telemetry.vssPulses))
-            append(',')
-            append(formatFloat(row.telemetry.offsetMap))
-            append(',')
-            append(formatFloat(row.telemetry.scaleMap))
-            append(',')
-            append(formatFloat(row.telemetry.offsetTps))
-            append(',')
-            append(formatFloat(row.telemetry.targetBoost))
-            append(',')
-            append(formatFloat(row.telemetry.limitBoostBar))
-            append(',')
-            append(formatFloat(row.telemetry.kP))
-            append(',')
-            append(formatFloat(row.telemetry.kI))
-            append(',')
-            append(formatFloat(row.telemetry.kD))
-            append(',')
-            append(formatFloat(row.telemetry.learnCoeff))
-            append(',')
-            append(row.telemetry.tireW)
-            append(',')
-            append(row.telemetry.tireA)
-            append(',')
-            append(row.telemetry.tireR)
-            append(',')
-            append(formatFloat(row.telemetry.engineHours))
-            append(',')
-            append(row.telemetry.klineBytes)
-            append(',')
-            append(row.telemetry.klineFrames)
-            append(',')
-            append(csvCell(row.telemetry.klineLastHex))
-            append(',')
-            append(csvCell(row.telemetry.lastAck.orEmpty()))
-            append(',')
-            append(csvCell(row.telemetry.lastError.orEmpty()))
-            appendLine()
+            appendLine(tripLogColumns.joinToString(",") { it.value(row) })
         }
     }
 
@@ -161,21 +136,19 @@ class BoosterViewModel : ViewModel() {
             logSessionStartedAt = telemetryAt
         }
 
-        tripLogRows += TripLogRow(
-            recordedAtMillis = telemetryAt,
-            sessionMillis = telemetryAt - logSessionStartedAt,
-            connectionStatus = connectionStatus.value,
-            telemetry = data
+        tripLogRows.addLast(
+            TripLogRow(
+                recordedAtMillis = telemetryAt,
+                sessionMillis = telemetryAt - logSessionStartedAt,
+                connectionStatus = connectionStatus.value,
+                telemetry = data
+            )
         )
+        while (tripLogRows.size > MAX_TRIP_LOG_ROWS) {
+            tripLogRows.removeFirst()
+        }
         lastLoggedTelemetryAt = telemetryAt
         _tripLogSize.value = tripLogRows.size
-    }
-
-    private fun buildHeader(): String = buildString {
-        append("recorded_at_ms,session_ms,connection_status")
-        append(",boost,min_boost,max_boost,rpm,max_rpm,speed,max_speed,tps,total_distance")
-        append(",base_duty,current_duty,mode,pulses_rpm,vss_pulses,offset_map,scale_map,offset_tps")
-        append(",target_boost,limit_boost_bar,kp,ki,kd,learn_coeff,tire_w,tire_a,tire_r,engine_hours,kline_bytes,kline_frames,kline_last_hex,last_ack,last_error")
     }
 
     private fun appendDiagnosticLogIfNeeded(data: TelemetryData) {
