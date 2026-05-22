@@ -136,9 +136,9 @@ fun DashboardScreen(viewModel: BoosterViewModel) {
         if (data.telemetryUpdatedAtMillis == 0L) return@LaunchedEffect
         filteredBoost = (data.boost * 0.6f) + (filteredBoost * 0.4f)
         filteredSpeed = if (data.speed < 2f) data.speed.toFloat()
-                        else (data.speed * 0.4f) + (filteredSpeed * 0.6f)
+                        else (data.speed * 0.25f) + (filteredSpeed * 0.75f)   // midpoint of original 0.1 and 0.4
         filteredRpm = if (data.rpm < 10f) data.rpm.toFloat()
-                      else (data.rpm * 0.35f) + (filteredRpm * 0.65f)
+                      else (data.rpm * 0.275f) + (filteredRpm * 0.725f)   // midpoint of original 0.2 and 0.35
     }
 
     val animatedBoost by animateFloatAsState(

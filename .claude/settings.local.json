@@ -5,7 +5,8 @@
       "PowerShell(where.exe java 2>$null; Get-ChildItem \"$env:LOCALAPPDATA\\\\Programs\" -Directory -ErrorAction SilentlyContinue | Select-Object -First 10 Name)",
       "Bash(export JAVA_HOME=\"/c/Program Files/Android/Android Studio/jbr\")",
       "Bash(export PATH=\"$JAVA_HOME/bin:$PATH\")",
-      "Bash(echo \"exit=$?\")"
+      "Bash(echo \"exit=$?\")",
+      "PowerShell($f = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue; if \\($f\\) { $f.Source } else { \"ffmpeg: not found\" }; $p = Get-Command python.exe -ErrorAction SilentlyContinue; if \\($p\\) { \"python: \" + $p.Source } else { \"python: not found\" }; $py = Get-Command py.exe -ErrorAction SilentlyContinue; if \\($py\\) { \"py: \" + $py.Source } else { \"py: not found\" })"
     ]
   }
 }

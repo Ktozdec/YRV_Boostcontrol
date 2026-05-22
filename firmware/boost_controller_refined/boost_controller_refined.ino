@@ -44,7 +44,7 @@ constexpr float HARD_LIMP_BOOST_BAR = 1.15f;
 // (Protection thresholds are SOFT_LIMP_BOOST_BAR / HARD_LIMP_BOOST_BAR above.)
 
 // -- Control loop timing & robustness --
-constexpr uint32_t CONTROL_PERIOD_MS = 10;     // 100 Hz control loop (matched to sensor cadence)
+constexpr uint32_t CONTROL_PERIOD_MS = 50;     // 20 Hz. 10 ms (100 Hz) starved the software tach ISR → RPM read half. Keep at 50.
 constexpr int   ADC_FAIL_LIMIT       = 4;      // consecutive ADC failures before forcing limp (~50 ms)
 constexpr uint32_t MAP_SAVE_INTERVAL_MS = 60000; // NVS map flush no more than once per minute (when changed)
 
@@ -227,6 +227,7 @@ volatile Mode systemMode = NORMAL;
 portMUX_TYPE rpmMux = portMUX_INITIALIZER_UNLOCKED;
 volatile unsigned long rpmPeriodUs = 0;
 volatile unsigned long lastRpmMicros = 0;
+volatile uint32_t g_rpmEdges = 0;   // diagnostic: total accepted tach edges
 
 BLEServer *pServer = nullptr;
 BLECharacteristic *pTxCharacteristic = nullptr;
@@ -941,10 +942,12 @@ class MyCallbacks : public BLECharacteristicCallbacks {
 void IRAM_ATTR handleRPM() {
     unsigned long now = micros();
     portENTER_CRITICAL_ISR(&rpmMux);
+    // Restored exactly to the version that read RPM 1:1 before the 05-21 changes.
     unsigned long dt = now - lastRpmMicros;
     if (dt > 3500) {
         rpmPeriodUs = dt;
         lastRpmMicros = now;
+        g_rpmEdges++;
     }
     portEXIT_CRITICAL_ISR(&rpmMux);
 }
@@ -1279,7 +1282,11 @@ void TaskControl(void *pvParameters) {
                 // Adaptive feed-forward (P1): move the steady integral bias into the map and
                 // bleed the integral by the same amount — the map permanently absorbs the offset,
                 // converging in seconds and leaving the integral free for transients.
-                float offload = constrainFloat(pid.integral * pid.learnCoeff, -MAP_LEARN_MAX_STEP, MAP_LEARN_MAX_STEP);
+                // loopScale keeps learning speed independent of CONTROL_PERIOD_MS: at 50 ms the
+                // loop fires 5x less often than the original 10 ms design, so each step is 5x larger.
+                float loopScale = CONTROL_PERIOD_MS / 10.0f;
+                float maxStep = MAP_LEARN_MAX_STEP * loopScale;
+                float offload = constrainFloat(pid.integral * pid.learnCoeff * loopScale, -maxStep, maxStep);
                 learnDutyMap3D(d.rpm, d.tps, offload, err);
                 pid.integral -= offload * INTEGRAL_TRANSFER;
             }
@@ -1352,6 +1359,12 @@ void TaskTelemetry(void *pvParameters) {
                 g_ch0ok ? "OK" : "FAIL", g_ch0v,
                 g_ch1ok ? "OK" : "FAIL", g_ch1v,
                 DAC_OUTPUT_ENABLED ? "on" : "off");
+            // Raw tach: periodUs = time between accepted edges; edges = running count.
+            // rpm = 60e6 / periodUs / pulsesPerRev. Two prints 5 s apart → edges/5 = real edge Hz.
+            Serial.printf("RPMraw periodUs:%lu edges:%lu  loopMs:%u\n",
+                static_cast<unsigned long>(rpmPeriodUs),
+                static_cast<unsigned long>(g_rpmEdges),
+                static_cast<unsigned>(CONTROL_PERIOD_MS));
             Serial.printf("KLINE bytes:%lu frames:%lu lastLen:%u overflows:%lu\n",
                 static_cast<unsigned long>(kline.byteCount),
                 static_cast<unsigned long>(kline.frameCount),
