@@ -1075,11 +1075,25 @@ void TaskKLineReader(void *pvParameters) {
     }
 }
 
+// Median of the 5-element RPM history. Rejects up to 2 outliers and smooths the real
+// cycle-to-cycle idle variation, while staying responsive at higher RPM.
+static float medianRpm5(const float h[5]) {
+    float a[5];
+    for (int i = 0; i < 5; i++) a[i] = h[i];
+    for (int i = 1; i < 5; i++) {
+        float key = a[i];
+        int j = i - 1;
+        while (j >= 0 && a[j] > key) { a[j + 1] = a[j]; j--; }
+        a[j + 1] = key;
+    }
+    return a[2];
+}
+
 void TaskSensors(void *pvParameters) {
     (void)pvParameters;
     esp_task_wdt_add(nullptr);
     unsigned long lastSpdCalcMs = millis();
-    float rpmHist[3] = {0, 0, 0};
+    float rpmHist[5] = {0, 0, 0, 0, 0};
     float smoothedSpeed = 0.0f;
 
     for (;;) {
@@ -1140,9 +1154,11 @@ void TaskSensors(void *pvParameters) {
 
         unsigned long period;
         unsigned long lastTime;
+        uint32_t currentEdges;
         portENTER_CRITICAL(&rpmMux);
         period = rpmPeriodUs;
         lastTime = lastRpmMicros;
+        currentEdges = g_rpmEdges;
         portEXIT_CRITICAL(&rpmMux);
 
         float instRPM = 0.0f;
@@ -1151,10 +1167,20 @@ void TaskSensors(void *pvParameters) {
         }
         instRPM = constrainFloat(instRPM, 0.0f, 12000.0f);
 
-        rpmHist[2] = rpmHist[1];
-        rpmHist[1] = rpmHist[0];
-        rpmHist[0] = instRPM;
-        float medRPM = max(min(rpmHist[0], rpmHist[1]), min(max(rpmHist[0], rpmHist[1]), rpmHist[2]));
+        // Shift the history ONLY when a real new tach edge arrived (per-edge, not per-10 ms loop).
+        // This is the key fix: otherwise the same period is copied into several slots and the
+        // median follows the jitter instead of rejecting it. With real consecutive periods, a
+        // jitter pair [long, short] cancels out and the median returns the true value.
+        static uint32_t lastProcessedEdges = 0;
+        if (currentEdges != lastProcessedEdges) {
+            for (int i = 4; i > 0; i--) rpmHist[i] = rpmHist[i - 1];
+            rpmHist[0] = instRPM;
+            lastProcessedEdges = currentEdges;
+        } else if (instRPM == 0.0f) {
+            for (int i = 0; i < 5; i++) rpmHist[i] = 0.0f;   // engine stopped → clear stale history
+        }
+
+        float medRPM = medianRpm5(rpmHist);
 
         if (nowMs - lastSpdCalcMs >= 200) {
             float dt = (nowMs - lastSpdCalcMs) / 1000.0f;
