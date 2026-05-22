@@ -85,7 +85,9 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
     var showOtaDialog by remember { mutableStateOf(false) }
     var justSaved by remember { mutableStateOf(false) }
 
-    LaunchedEffect(data.targetBoost) {
+    // Keyed on isInitialized too: when the connect effect below resets it, this re-fires and
+    // re-fills the drafts even if targetBoost didn't change value (fixes the stuck-init race).
+    LaunchedEffect(data.targetBoost, isInitialized) {
         if (!isInitialized && data.targetBoost != 0f) {
             draftTb = data.targetBoost
             draftLb = data.limitBoostBar
@@ -121,7 +123,9 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         }
     }
 
-    val isSettingsLoaded = isInitialized && data.targetBoost != 0f
+    // Button enables on whether real settings are present (targetBoost is never 0 once an "S"
+    // packet arrived) — NOT on the one-shot isInitialized flag, which the connect effect resets.
+    val isSettingsLoaded = data.targetBoost != 0f
 
     val saveButtonColor by animateColorAsState(
         targetValue = when {

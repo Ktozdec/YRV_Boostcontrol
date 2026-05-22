@@ -48,6 +48,12 @@ constexpr uint32_t CONTROL_PERIOD_MS = 10;     // 100 Hz control loop (matched t
 constexpr int   ADC_FAIL_LIMIT       = 4;      // consecutive ADC failures before forcing limp (~50 ms)
 constexpr uint32_t MAP_SAVE_INTERVAL_MS = 60000; // NVS map flush no more than once per minute (when changed)
 
+// -- Diagnostics --
+// Set to false to STOP writing the MCP4725 DAC: an A/B test for whether the DAC writes (0x60)
+// disturb the I2C bus and break the ADS1115 reads. (ECU loses the MAP passthrough while off —
+// for a stationary bench test only.)
+constexpr bool DAC_OUTPUT_ENABLED = true;
+
 // -- PID base gains (also power-on defaults; a saved value in NVS overrides them) --
 constexpr float DEFAULT_KP = 28.0f;
 constexpr float DEFAULT_KI = 16.0f;
@@ -136,10 +142,10 @@ struct PID_Config {
 } pid;
 
 struct RuntimeConfig {
-    float offsetPIM = 2.57f;
-    float scalePIM = 0.64f;
+    float offsetPIM = 2.56f;
+    float scalePIM = 0.55f;
     float pulsesPerRev = 2.0f;
-    float offsetVTA = 0.35f;
+    float offsetVTA = 0.42f;
     float targetBoost = 0.80f;
     float limitBoostBar = 0.95f;
     float vssPulsesPerRev = 5.18f;
@@ -225,6 +231,12 @@ volatile unsigned long lastRpmMicros = 0;
 BLEServer *pServer = nullptr;
 BLECharacteristic *pTxCharacteristic = nullptr;
 volatile bool deviceConnected = false;
+volatile uint16_t bleConnId = 0;   // current connection id, for per-link MTU lookup
+volatile int g_adcFailStreak = 0;  // consecutive ADS1115 read failures (0 = bus healthy)
+volatile bool g_ch0ok = false;     // last raw read status, channel 0 (MAP), pre-debounce
+volatile bool g_ch1ok = false;     // last raw read status, channel 1 (TPS), pre-debounce
+volatile float g_ch0v = 0.0f;      // last raw volts, channel 0 (MAP), pre-debounce
+volatile float g_ch1v = 0.0f;      // last raw volts, channel 1 (TPS), pre-debounce
 
 #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -361,8 +373,24 @@ bool isMapPlausibleLocked() {
 void sendBleText(const char *text) {
     if (!deviceConnected || pTxCharacteristic == nullptr || text == nullptr) return;
     if (!takeMutex(bleMutex, pdMS_TO_TICKS(20))) return;
-    pTxCharacteristic->setValue(reinterpret_cast<const uint8_t *>(text), strlen(text));
-    pTxCharacteristic->notify();
+
+    const size_t len = strlen(text);
+
+    // A single notify() only delivers up to (MTU-3) bytes — the rest, including the framing '\n',
+    // is silently dropped. The long settings ("S") packet is bigger than the telemetry ("T") packet,
+    // so on a small negotiated MTU telemetry arrives but settings get truncated and never parse.
+    // Split into MTU-sized chunks; the app reassembles them by the '\n' delimiter.
+    uint16_t mtu = (pServer != nullptr) ? pServer->getPeerMTU(bleConnId) : 0;
+    size_t chunk = (mtu > 23) ? static_cast<size_t>(mtu - 3) : 20;
+
+    size_t offset = 0;
+    while (offset < len) {
+        size_t n = (len - offset < chunk) ? (len - offset) : chunk;
+        pTxCharacteristic->setValue(reinterpret_cast<const uint8_t *>(text + offset), n);
+        pTxCharacteristic->notify();
+        offset += n;
+        if (offset < len) vTaskDelay(pdMS_TO_TICKS(4));   // let the stack flush between chunks
+    }
     xSemaphoreGive(bleMutex);
 }
 
@@ -803,6 +831,7 @@ class MyServerCallbacks : public BLEServerCallbacks {
     void onConnect(BLEServer *server, esp_ble_gatts_cb_param_t *param) override {
         (void)server;
         deviceConnected = true;
+        bleConnId = param->connect.conn_id;
         sendSettingsRequested = true;
         // Request fast connection interval immediately after pairing:
         // min=12*1.25ms=15ms, max=24*1.25ms=30ms, latency=0, timeout=400*10ms=4s
@@ -945,34 +974,41 @@ void initPCNT() {
 int16_t safeReadADS1115(uint8_t channel, uint32_t timeoutMs = 10) {
     // Keep ADC full-scale and software multiplier in sync:
     // PGA = +/- 6.144V  -> 0.1875 mV/LSB
-    uint16_t config = ADS1115_CFG_BASE;
-    config |= ((4 + channel) << 12);
+    // Up to 3 attempts: a single NACK/glitch from a noisy bus (or right after a DAC write)
+    // shouldn't lose the reading. Each failed transaction ends with a STOP, freeing the bus.
+    for (int attempt = 0; attempt < 3; attempt++) {
+        uint16_t config = ADS1115_CFG_BASE;
+        config |= ((4 + channel) << 12);
 
-    Wire.beginTransmission(ADS1115_I2C_ADDR);
-    Wire.write(1);
-    Wire.write(static_cast<uint8_t>(config >> 8));
-    Wire.write(static_cast<uint8_t>(config & 0xFF));
-    if (Wire.endTransmission() != 0) return INT16_MIN;
-
-    uint32_t start = millis();
-    while (millis() - start < timeoutMs) {
         Wire.beginTransmission(ADS1115_I2C_ADDR);
         Wire.write(1);
-        if (Wire.endTransmission() != 0) break;
+        Wire.write(static_cast<uint8_t>(config >> 8));
+        Wire.write(static_cast<uint8_t>(config & 0xFF));
+        if (Wire.endTransmission() != 0) { delayMicroseconds(250); continue; }
+
+        uint32_t start = millis();
+        bool ready = false;
+        while (millis() - start < timeoutMs) {
+            Wire.beginTransmission(ADS1115_I2C_ADDR);
+            Wire.write(1);
+            if (Wire.endTransmission() != 0) break;
+            Wire.requestFrom(ADS1115_I2C_ADDR, static_cast<uint8_t>(2));
+            if (Wire.available() == 2) {
+                uint16_t status = (Wire.read() << 8) | Wire.read();
+                if ((status & 0x8000) != 0) { ready = true; break; }
+            }
+            vTaskDelay(pdMS_TO_TICKS(1));
+        }
+        if (!ready) { delayMicroseconds(250); continue; }
+
+        Wire.beginTransmission(ADS1115_I2C_ADDR);
+        Wire.write(0);
+        if (Wire.endTransmission() != 0) { delayMicroseconds(250); continue; }
         Wire.requestFrom(ADS1115_I2C_ADDR, static_cast<uint8_t>(2));
         if (Wire.available() == 2) {
-            uint16_t status = (Wire.read() << 8) | Wire.read();
-            if ((status & 0x8000) != 0) break;
+            return static_cast<int16_t>((Wire.read() << 8) | Wire.read());
         }
-        vTaskDelay(pdMS_TO_TICKS(1));
-    }
-
-    Wire.beginTransmission(ADS1115_I2C_ADDR);
-    Wire.write(0);
-    if (Wire.endTransmission() != 0) return INT16_MIN;
-    Wire.requestFrom(ADS1115_I2C_ADDR, static_cast<uint8_t>(2));
-    if (Wire.available() == 2) {
-        return static_cast<int16_t>((Wire.read() << 8) | Wire.read());
+        delayMicroseconds(250);
     }
     return INT16_MIN;
 }
@@ -1050,6 +1086,14 @@ void TaskSensors(void *pvParameters) {
         int16_t r0 = safeReadADS1115(0, 10);
         int16_t r1 = safeReadADS1115(1, 10);
 
+        // Per-channel raw status (pre-debounce) for diagnostics. The debounce below zeroes BOTH
+        // rawPIM and rawVTA whenever EITHER channel fails, so this is the only place the true
+        // per-channel state is visible (e.g. MAP OK while TPS fails).
+        g_ch0ok = (r0 != INT16_MIN);
+        g_ch1ok = (r1 != INT16_MIN);
+        g_ch0v = g_ch0ok ? (r0 * ADS1115_MULTIPLIER_6V144) : 0.0f;
+        g_ch1v = g_ch1ok ? (r1 * ADS1115_MULTIPLIER_6V144) : 0.0f;
+
         // ADC debounce (F4): a single I2C glitch must not drop us into limp. Ride through
         // brief failures on the last good reading; only force a fault (0 V → limp) after
         // ADC_FAIL_LIMIT consecutive misses.
@@ -1075,6 +1119,7 @@ void TaskSensors(void *pvParameters) {
             lastGoodPIM = rawPIM;
             lastGoodVTA = rawVTA;
         }
+        g_adcFailStreak = adcFailCount;   // surfaced in the Diag line
 
         filtered_map_volts = FILTER_OLD * filtered_map_volts + FILTER_NEW * rawPIM;
         float real_boost_bar = (filtered_map_volts - localCfg.offsetPIM) * localCfg.scalePIM;
@@ -1083,7 +1128,9 @@ void TaskSensors(void *pvParameters) {
         float out_volts = (ecu_boost_bar / localCfg.scalePIM) + localCfg.offsetPIM;
         out_volts = constrainFloat(out_volts, 0.0f, DAC_REFERENCE_VOLTAGE);
         uint16_t dac_value = (uint16_t)((out_volts / DAC_REFERENCE_VOLTAGE) * 4095.0f);
-        dac.setVoltage(dac_value, false);
+        if (DAC_OUTPUT_ENABLED) {
+            dac.setVoltage(dac_value, false);   // disable via DAC_OUTPUT_ENABLED to A/B test the bus
+        }
 
         float tpsSpan = max(0.3f, 3.71f - localCfg.offsetVTA);
         float tpsRaw = constrainFloat((rawVTA - localCfg.offsetVTA) / tpsSpan * 100.0f, 0.0f, 100.0f);
@@ -1288,11 +1335,23 @@ void TaskTelemetry(void *pvParameters) {
 
         if (millis() - lastPrint > 5000) {
             KLineState kline = snapshotKLine();
-            Serial.printf("Diag Heap:%u MaxBlock:%u TelStack:%u Mode:%d\n",
+            Serial.printf("Diag Heap:%u MaxBlock:%u TelStack:%u Mode:%d MTU:%u Conn:%d\n",
                 ESP.getFreeHeap(),
                 ESP.getMaxAllocHeap(),
                 uxTaskGetStackHighWaterMark(nullptr),
-                static_cast<int>(systemMode));
+                static_cast<int>(systemMode),
+                (deviceConnected && pServer != nullptr) ? pServer->getPeerMTU(bleConnId) : 0,
+                deviceConnected ? 1 : 0);
+            // Sensor snapshot. ADCfail>0 means the ESP can't talk to the ADS1115 (I2C fault) —
+            // that is NOT "0 V on the input". 0.000 V with ADCfail>0 = bus/comms loss.
+            Serial.printf("Sensors PIM:%.3fV VTA:%.3fV boost:%.2f rpm:%.0f tps:%.0f%% speed:%.0f ADCfail:%d\n",
+                d.rawPIM, d.rawVTA, d.boost, d.rpm, d.tps, d.speed, g_adcFailStreak);
+            // True per-channel reads (pre-debounce) + DAC state. This tells us whether MAP (ch0)
+            // still reads in runtime while TPS (ch1) fails, or both die — and isolates the DAC.
+            Serial.printf("ADC ch0(MAP):%s %.3fV  ch1(TPS):%s %.3fV  DAC:%s\n",
+                g_ch0ok ? "OK" : "FAIL", g_ch0v,
+                g_ch1ok ? "OK" : "FAIL", g_ch1v,
+                DAC_OUTPUT_ENABLED ? "on" : "off");
             Serial.printf("KLINE bytes:%lu frames:%lu lastLen:%u overflows:%lu\n",
                 static_cast<unsigned long>(kline.byteCount),
                 static_cast<unsigned long>(kline.frameCount),
@@ -1523,6 +1582,7 @@ void setup() {
     };
     esp_task_wdt_init(&twdt_config);
 
+    Serial.println("Step: NVS init...");
     if (!prefs.begin("yrv_v4", false)) {
         Serial.println("Crit Error: NVS Init failed!");
     }
@@ -1530,8 +1590,8 @@ void setup() {
     otaModeEnabled = prefs.getBool("ota_mode", false);
 
     if (takeMutex(configMutex, pdMS_TO_TICKS(100))) {
-        cfg.offsetPIM = constrainFloat(prefs.getFloat("oP", 2.57f), 0.1f, 4.5f);
-        cfg.scalePIM = constrainFloat(prefs.getFloat("sP", 0.64f), 0.1f, 2.0f);
+        cfg.offsetPIM = constrainFloat(prefs.getFloat("oP", 2.56f), 0.1f, 4.5f);
+        cfg.scalePIM = constrainFloat(prefs.getFloat("sP", 0.55f), 0.1f, 2.0f);
         cfg.pulsesPerRev = constrainFloat(prefs.getFloat("pR", 2.0f), 0.5f, 8.0f);
         cfg.offsetVTA = constrainFloat(prefs.getFloat("oV", 0.42f), 0.1f, 3.5f);
         cfg.targetBoost = constrainFloat(prefs.getFloat("tB", 0.80f), 0.3f, 1.5f);
@@ -1546,26 +1606,33 @@ void setup() {
         pid.kD = constrainFloat(prefs.getFloat("kD", DEFAULT_KD), 0.0f, 50.0f);
         pid.learnCoeff = constrainFloat(prefs.getFloat("lA", DEFAULT_LEARN_RATE), LEARN_RATE_MIN, LEARN_RATE_MAX);
 
-        // One-time migration to the v5 adaptive tune. The meaning of lA changed (it is now the
-        // integral-offload rate), so old saved gains must be refreshed once. Calibration,
-        // odometer and the learned map are preserved. (On a full-erase flash this is a no-op
-        // because the defaults above already equal these values.)
-        if (prefs.getInt("tuneVer", 0) < 5) {
+        // One-time migration to the v6 tune. Forces the adaptive PID gains AND the requested
+        // sensor calibrations (oP/sP/oV) once, overriding any stale values saved in NVS. After
+        // this runs, the app can still fine-tune them and the changes persist.
+        // (oP is also re-set by the atmosphere auto-zero at every boot — see below.)
+        if (prefs.getInt("tuneVer", 0) < 6) {
             pid.kP = DEFAULT_KP;
             pid.kI = DEFAULT_KI;
             pid.kD = DEFAULT_KD;
             pid.learnCoeff = DEFAULT_LEARN_RATE;
+            cfg.offsetPIM = 2.56f;
+            cfg.scalePIM = 0.55f;
+            cfg.offsetVTA = 0.42f;
             prefs.putFloat("kP", pid.kP);
             prefs.putFloat("kI", pid.kI);
             prefs.putFloat("kD", pid.kD);
             prefs.putFloat("lA", pid.learnCoeff);
-            prefs.putInt("tuneVer", 5);
+            prefs.putFloat("oP", cfg.offsetPIM);
+            prefs.putFloat("sP", cfg.scalePIM);
+            prefs.putFloat("oV", cfg.offsetVTA);
+            prefs.putInt("tuneVer", 6);
         }
         xSemaphoreGive(configMutex);
     }
 
     totalDistanceKm = prefs.getDouble("oD", 0.0);
     stationaryEngineHours = prefs.getDouble("eH", 0.0);
+    Serial.println("Step: load map...");
     loadMap();
 
     sensors = {0, 0, 0, 0, 0, 1.0f, 0, 0, 0, 0};
@@ -1578,32 +1645,43 @@ void setup() {
         return;
     }
 
+    Serial.println("Step: I2C begin...");
     Wire.begin(sdaPin, sclPin);
-    Wire.setClock(400000);
+    Wire.setClock(100000);   // 100 kHz: reliable through the logic-level converter (400 kHz corrupted ADS1115 reads)
     Wire.setTimeOut(20);
 
+    Serial.println("Step: ADS1115 begin...");
     if (!ads.begin()) {
         Serial.println("Error: ADS1115 not found!");
     }
     ads.setGain(GAIN_TWOTHIRDS);
     ads.setDataRate(RATE_ADS1115_860SPS);
 
-    dac.begin(0x62);
+    Serial.println("Step: MCP4725 begin...");
+    dac.begin(0x60);   // MCP4725 actual address (I2C scan found 0x60, not 0x62)
 
+    // Auto-zero the MAP at atmosphere. Uses the timeout-bounded safeReadADS1115() instead of the
+    // Adafruit blocking read, so a flaky bus can never hang setup() in an endless conversion-wait.
+    Serial.println("Step: MAP auto-zero...");
     {
         float sumVolts = 0.0f;
+        int validSamples = 0;
         for (int i = 0; i < 10; i++) {
-            int16_t raw = ads.readADC_SingleEnded(0);
-            sumVolts += raw * 0.0001875f;
+            int16_t raw = safeReadADS1115(0, 10);
+            if (raw != INT16_MIN) {
+                sumVolts += raw * ADS1115_MULTIPLIER_6V144;
+                validSamples++;
+            }
             delay(5);
         }
-        float avgVolts = sumVolts / 10.0f;
-        if (avgVolts >= ATMOS_MIN_VOLTS && avgVolts <= ATMOS_MAX_VOLTS) {
+        float avgVolts = (validSamples > 0) ? (sumVolts / validSamples) : 0.0f;
+        if (validSamples > 0 && avgVolts >= ATMOS_MIN_VOLTS && avgVolts <= ATMOS_MAX_VOLTS) {
             cfg.offsetPIM = avgVolts;
-            Serial.printf("Auto-Zero: offset=%.3fV (calibrated)\n", cfg.offsetPIM);
+            Serial.printf("Auto-Zero: offset=%.3fV (calibrated, %d samples)\n", cfg.offsetPIM, validSamples);
         } else {
-            cfg.offsetPIM = DEFAULT_OFFSET;
-            Serial.printf("Auto-Zero: offset=%.3fV (default, avg=%.3fV)\n", cfg.offsetPIM, avgVolts);
+            // Keep the NVS-loaded calibration instead of forcing a default — safe after a
+            // mid-drive reboot (not at atmosphere) or if the ADC didn't answer this boot.
+            Serial.printf("Auto-Zero: skipped (avg=%.3fV, valid=%d), keeping oP=%.3fV\n", avgVolts, validSamples, cfg.offsetPIM);
         }
         filtered_map_volts = cfg.offsetPIM;
     }
@@ -1620,6 +1698,7 @@ void setup() {
     ledcAttach(solPin, pwmFreq, pwmRes);
     ledcWrite(solPin, 0);
 
+    Serial.println("Step: BLE init...");
     BLEDevice::init("YRV_Boost_BLE");
     BLEDevice::setMTU(247);
     pServer = BLEDevice::createServer();
@@ -1645,11 +1724,13 @@ void setup() {
     pAdvertising->setMaxInterval(64);     // 64 * 0.625ms = 40ms
     pAdvertising->start();
 
+    Serial.println("Step: starting tasks...");
     xTaskCreatePinnedToCore(TaskSensors, "SENS", 4096, nullptr, 2, nullptr, 0);
     xTaskCreatePinnedToCore(TaskKLineReader, "KLINE", 3072, nullptr, 1, nullptr, 0);
     xTaskCreatePinnedToCore(TaskControl, "CTRL", 4096, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(TaskTelemetry, "TELEM", 4096, nullptr, 1, nullptr, 1);
     xTaskCreatePinnedToCore(TaskOdometerAndStorage, "ODO_STOR", 4096, nullptr, 1, nullptr, 0);
+    Serial.println("Setup complete. Running.");
 }
 
 void loop() {
