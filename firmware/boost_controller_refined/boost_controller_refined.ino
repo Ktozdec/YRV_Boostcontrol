@@ -336,14 +336,17 @@ void sanitizeMapProfileLocked() {
 
 void initDefaultMapLocked() {
     // Rows = TPS {10,25,40,60,80,100}, Cols = RPM {1500..7500 step 500}.
-    // Higher base duty at light load / low RPM (hold wastegate to spool), gentle taper up top.
+    // Higher duty = more boost on this solenoid (it bleeds the wastegate signal, holding the gate
+    // shut). So the base feed-forward RISES with load (TPS) and RPM to hold the gate against rising
+    // exhaust backpressure, with a gentle taper at the very top to protect the turbo. Light throttle
+    // stays near zero so the car does not build boost off-throttle; the PID + self-learning trim the rest.
     const float defaults[NUM_TPS_BINS][NUM_RPM_BINS] = {
-        {62, 62, 62, 62, 62, 60, 58, 57, 56, 52, 52, 52, 50},
-        {58, 58, 56, 55, 53, 52, 50, 48, 47, 45, 43, 42, 42},
-        {55, 55, 55, 52, 50, 50, 48, 45, 45, 42, 40, 40, 39},
-        {50, 50, 49, 47, 45, 44, 42, 42, 40, 40, 38, 37, 36},
-        {46, 46, 45, 44, 43, 42, 41, 40, 39, 38, 37, 36, 35},
-        {43, 43, 42, 40, 40, 40, 38, 38, 38, 36, 35, 35, 34}
+        {  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0},   // 10% TPS — cruise, wastegate on spring
+        { 15, 15, 18, 20, 22, 25, 25, 25, 25, 25, 24, 22, 20},   // 25% TPS
+        { 25, 28, 32, 35, 38, 40, 42, 42, 42, 42, 40, 38, 36},   // 40% TPS
+        { 35, 38, 42, 46, 50, 52, 54, 55, 55, 54, 52, 50, 48},   // 60% TPS
+        { 42, 46, 50, 55, 58, 62, 64, 65, 65, 64, 62, 60, 58},   // 80% TPS
+        { 48, 52, 58, 62, 66, 70, 72, 73, 73, 72, 70, 68, 66}    // 100% TPS — WOT, max hold on the VF32 gate
     };
 
     memcpy(dutyMap2D, defaults, sizeof(dutyMap2D));
@@ -1665,6 +1668,18 @@ void setup() {
             prefs.putFloat("sP", cfg.scalePIM);
             prefs.putFloat("oV", cfg.offsetVTA);
             prefs.putInt("tuneVer", 6);
+        }
+
+        // v7 migration: the base feed-forward map was reshaped — duty now RISES with load (TPS) and
+        // RPM, matching this solenoid (higher duty bleeds the wastegate signal → gate shut → more
+        // boost). Bumping tuneVer alone does NOT reload the map, so drop the stale NVS map/confidence
+        // here; loadMap() below then rebuilds them from the new defaults. PID gains and sensor
+        // calibration are left untouched so any fine-tuning saved by the user survives.
+        if (prefs.getInt("tuneVer", 0) < 7) {
+            prefs.remove("map2D");
+            prefs.remove("conf2D");
+            prefs.remove("samples2D");
+            prefs.putInt("tuneVer", 7);
         }
         xSemaphoreGive(configMutex);
     }
