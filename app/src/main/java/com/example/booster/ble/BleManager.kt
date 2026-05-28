@@ -139,6 +139,8 @@ class BleManager {
                                     offsetTps = json.optDouble("oV", current.offsetTps.toDouble()).toFloat(),
                                     targetBoost = json.optDouble("tB", current.targetBoost.toDouble()).toFloat(),
                                     limitBoostBar = json.optDouble("lB", current.limitBoostBar.toDouble()).toFloat(),
+                                    softLimpBar = json.optDouble("sL", current.softLimpBar.toDouble()).toFloat(),
+                                    hardLimpBar = json.optDouble("hL", current.hardLimpBar.toDouble()).toFloat(),
                                     kP = json.optDouble("kP", current.kP.toDouble()).toFloat(),
                                     kI = json.optDouble("kI", current.kI.toDouble()).toFloat(),
                                     kD = json.optDouble("kD", current.kD.toDouble()).toFloat(),

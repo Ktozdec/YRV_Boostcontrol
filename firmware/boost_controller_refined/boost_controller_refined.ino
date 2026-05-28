@@ -36,8 +36,8 @@ constexpr uint16_t ADS1115_CFG_BASE =
     ADS1115_CFG_MODE_SINGLE |
     ADS1115_CFG_DR_860 |
     ADS1115_CFG_COMP_DISABLE;
-constexpr float SOFT_LIMP_BOOST_BAR = 1.05f;
-constexpr float HARD_LIMP_BOOST_BAR = 1.15f;
+constexpr float SOFT_LIMP_BOOST_BAR = 1.15f;   // power-on default for cfg.softLimpBar (runtime-tunable)
+constexpr float HARD_LIMP_BOOST_BAR = 1.30f;   // power-on default for cfg.hardLimpBar (runtime-tunable)
 
 // =============================== ADAPTIVE TUNING ===============================
 // One place for the knobs that shape boost behaviour and self-learning.
@@ -58,8 +58,18 @@ constexpr bool DAC_OUTPUT_ENABLED = true;
 constexpr float DEFAULT_KP = 28.0f;
 constexpr float DEFAULT_KI = 16.0f;
 constexpr float DEFAULT_KD = 10.0f;
-constexpr float INTEGRAL_LIMIT      = 30.0f;   // anti-windup clamp on the integral term
+constexpr float INTEGRAL_LIMIT      = 15.0f;   // anti-windup clamp on the integral term (% duty)
+constexpr float INTEGRAL_BAND       = 0.15f;   // integrate ONLY within this |error| (bar) of target;
+                                               // outside it P + feed-forward do the gross work, so the
+                                               // integral can't wind up during the spool ramp → no overshoot.
 constexpr float TARGET_FILTER_TAU_S = 0.35f;   // smoothing time constant for the boost target
+
+// -- Actuator slew limiting --
+// The solenoid + wastegate + turbo cannot follow an instant duty step; an unrestricted jump excites
+// the boost oscillation. Cap how fast the commanded duty may move (per second, so it is independent of
+// loop period). Generous enough that it does not choke spool (≈full 0-100% sweep in ~0.5 s), but it
+// removes the abrupt steps that set up hunting. HARD_LIMP bypasses this — protection stays instant.
+constexpr float DUTY_SLEW_PER_S = 200.0f;
 
 // -- Self-learning (adaptive feed-forward map) --
 constexpr float DEFAULT_LEARN_RATE  = 0.10f;   // lA: fraction of the steady integral bias baked into the map per update
@@ -148,6 +158,8 @@ struct RuntimeConfig {
     float offsetVTA = 0.42f;
     float targetBoost = 0.80f;
     float limitBoostBar = 0.95f;
+    float softLimpBar = SOFT_LIMP_BOOST_BAR;   // boost above this clamps duty to 20% (soft cut)
+    float hardLimpBar = HARD_LIMP_BOOST_BAR;   // boost above this drops duty to 0% (hard cut)
     float vssPulsesPerRev = 5.18f;
     int tireW = 195;
     int tireA = 55;
@@ -344,9 +356,9 @@ void initDefaultMapLocked() {
         {  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  0},   // 10% TPS — cruise, wastegate on spring
         { 15, 15, 18, 20, 22, 25, 25, 25, 25, 25, 24, 22, 20},   // 25% TPS
         { 25, 28, 32, 35, 38, 40, 42, 42, 42, 42, 40, 38, 36},   // 40% TPS
-        { 35, 38, 42, 46, 50, 52, 54, 55, 55, 54, 52, 50, 48},   // 60% TPS
-        { 42, 46, 50, 55, 58, 62, 64, 65, 65, 64, 62, 60, 58},   // 80% TPS
-        { 48, 52, 58, 62, 66, 70, 72, 73, 73, 72, 70, 68, 66}    // 100% TPS — WOT, max hold on the VF32 gate
+        { 35, 38, 40, 43, 46, 48, 50, 53, 54, 54, 52, 50, 48},   // 60% TPS  (mid-RPM hump cooled ~10%)
+        { 42, 46, 48, 52, 55, 57, 59, 63, 64, 64, 62, 60, 58},   // 80% TPS  (mid-RPM hump cooled ~10%)
+        { 48, 52, 55, 58, 62, 65, 67, 71, 72, 72, 70, 68, 66}    // 100% TPS — WOT (mid-RPM hump cooled ~10%)
     };
 
     memcpy(dutyMap2D, defaults, sizeof(dutyMap2D));
@@ -819,6 +831,12 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
     } else if (key == "lB") {
         ok = parseFloatStrict(rawValue, 0.3f, 2.0f, fValue);
         if (ok) cfg.limitBoostBar = fValue;
+    } else if (key == "sL") {
+        ok = parseFloatStrict(rawValue, 0.5f, 2.0f, fValue);
+        if (ok) cfg.softLimpBar = fValue;
+    } else if (key == "hL") {
+        ok = parseFloatStrict(rawValue, 0.5f, 2.5f, fValue);
+        if (ok) cfg.hardLimpBar = fValue;
     } else {
         ok = false;
         error = "unknown_key";
@@ -1019,12 +1037,12 @@ int16_t safeReadADS1115(uint8_t channel, uint32_t timeoutMs = 10) {
     return INT16_MIN;
 }
 
-void updateSafety(const SensorData &d) {
+void updateSafety(const SensorData &d, float softLimpBar, float hardLimpBar) {
     if (d.rawPIM < 0.1f || d.rawPIM > 4.9f || d.rawVTA < 0.1f || d.rawVTA > 4.9f) {
         systemMode = HARD_LIMP;
-    } else if (isnan(d.boost) || d.boost > HARD_LIMP_BOOST_BAR || (d.rpm < 300.0f && d.tps > 5.0f)) {
+    } else if (isnan(d.boost) || d.boost > hardLimpBar || (d.rpm < 300.0f && d.tps > 5.0f)) {
         systemMode = HARD_LIMP;
-    } else if (d.boost > SOFT_LIMP_BOOST_BAR) {
+    } else if (d.boost > softLimpBar) {
         systemMode = SOFT_LIMP;
     } else {
         systemMode = NORMAL;
@@ -1243,7 +1261,7 @@ void TaskControl(void *pvParameters) {
             xSemaphoreGive(dataMutex);
         }
 
-        updateSafety(d);
+        updateSafety(d, localCfg.softLimpBar, localCfg.hardLimpBar);
         currentBaseDuty = getMappedBaseDuty2D(d.rpm, d.tps);
 
         // F1: precise loop timing from micros() (unsigned subtraction handles the ~71 min wrap).
@@ -1267,7 +1285,7 @@ void TaskControl(void *pvParameters) {
         float targetRate = (dynamicTarget - prevControlTarget) / dt;   // bar/s, smooth (target is low-passed)
         prevControlTarget = dynamicTarget;
 
-        if (systemMode == NORMAL && d.tps > 10.0f && d.rpm >= 1300.0f) {
+        if (systemMode != HARD_LIMP && d.tps > 10.0f && d.rpm >= 1300.0f) {
             float err = dynamicTarget - d.boost;
 
             // Gain scheduling: aggressive on spool, gentle up top.
@@ -1296,15 +1314,37 @@ void TaskControl(void *pvParameters) {
 
             // F3: conditional-integration anti-windup. Form the candidate integral, build the
             // output, and only commit the integral if we are not driving further into saturation.
-            float integralCandidate = constrainFloat(pid.integral + err * kiEff * dt, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
+            // Setpoint-band gate: integrate ONLY when boost is already close to target (|err| <
+            // INTEGRAL_BAND). During the spool ramp the error is large, so the integral is frozen and
+            // cannot wind up — that windup was the main cause of the post-spool overshoot. Near the
+            // target the integral resumes and trims out the steady-state offset like before.
+            bool nearSetpoint = fabs(err) < INTEGRAL_BAND;
+            float integralCandidate = nearSetpoint
+                ? constrainFloat(pid.integral + err * kiEff * dt, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
+                : pid.integral;
             float dutyUnclamped = currentBaseDuty + (err * kpEff) + integralCandidate + (pid.filteredDerivative * kdEff) + setpointFF;
             bool pushingIntoHigh = dutyUnclamped > MAP_DUTY_MAX && err > 0.0f;
             bool pushingIntoLow  = dutyUnclamped < MAP_DUTY_MIN && err < 0.0f;
-            if (!pushingIntoHigh && !pushingIntoLow) {
+            if (nearSetpoint && !pushingIntoHigh && !pushingIntoLow) {
                 pid.integral = integralCandidate;     // accept; otherwise freeze (no abrupt *0.9 kicks)
             }
 
             currentOutDuty = constrainFloat(dutyUnclamped, MAP_DUTY_MIN, MAP_DUTY_MAX);
+
+            // Soft limp: instead of slamming duty to a fixed 20% step (which collapsed spool and set
+            // up the boost oscillation), bleed the PID output down PROPORTIONALLY to how far boost has
+            // overshot the soft threshold — full output at softLimpBar, fading linearly to 0 as it
+            // approaches hardLimpBar. The PID keeps running underneath, so recovery is a smooth ramp
+            // back up, not an abrupt relatch. Hard limp (boost > hardLimpBar) still cuts to 0 below.
+            if (systemMode == SOFT_LIMP) {
+                float span = max(localCfg.hardLimpBar - localCfg.softLimpBar, 0.05f);
+                float x = constrainFloat((d.boost - localCfg.softLimpBar) / span, 0.0f, 1.0f);
+                // Quadratic soft-start: bleed = 1 - x^2. Near the soft threshold (x small) the squeeze
+                // is almost nil so the PID alone handles minor overshoot; it ramps in steeply only as
+                // boost approaches hardLimpBar, avoiding a fight with the PID right at the boundary.
+                float bleed = 1.0f - x * x;
+                currentOutDuty *= bleed;
+            }
 
             bool pidNotSaturated = currentOutDuty > 6.0f && currentOutDuty < 84.0f;
             if (pidNotSaturated && learningWindowStable(d, err)) {
@@ -1326,15 +1366,31 @@ void TaskControl(void *pvParameters) {
             pid.lastMeas = d.boost;
             lastMeasMicros = nowUs;
             pid.filteredDerivative = 0.0f;
-            currentOutDuty = (systemMode == SOFT_LIMP) ? 20.0f : 0.0f;
+            // Hard limp or genuine idle (low TPS/RPM): solenoid fully released, wastegate open.
+            // Soft limp now stays in the PID branch above and bleeds down smoothly instead.
+            currentOutDuty = 0.0f;
         }
+
+        // Slew-rate limit: ramp the commanded duty toward its target instead of stepping, so the
+        // solenoid never gets an instant jump it can't follow. HARD_LIMP bypasses it — protection
+        // must drop the gate immediately, not ramp down.
+        static float slewLimitedDuty = 0.0f;
+        if (systemMode == HARD_LIMP) {
+            slewLimitedDuty = 0.0f;
+        } else {
+            float maxStep = DUTY_SLEW_PER_S * dt;
+            slewLimitedDuty += constrainFloat(currentOutDuty - slewLimitedDuty, -maxStep, maxStep);
+        }
+        currentOutDuty = slewLimitedDuty;
 
         // F2: write the solenoid PWM immediately here — no separate TaskPWM, no 0–20 ms dead time.
         // Manual solenoid test (DUTY:) still overrides while the car is stationary.
+        // Round to the full 0-255 range (not truncate at 1% steps) for finer solenoid resolution.
         int requestedTestDuty = constrain(static_cast<int>(testDuty), 0, 100);
         int pwmByte = (d.speed < 2.0f && requestedTestDuty > 0)
-            ? map(requestedTestDuty, 0, 100, 0, 255)
-            : map(static_cast<int>(currentOutDuty), 0, 100, 0, 255);
+            ? static_cast<int>(lroundf(requestedTestDuty / 100.0f * 255.0f))
+            : static_cast<int>(lroundf(constrainFloat(currentOutDuty, 0.0f, 100.0f) / 100.0f * 255.0f));
+        pwmByte = constrain(pwmByte, 0, 255);
         ledcWrite(solPin, pwmByte);
 
         // F6: when the engine stops, flush the learned map promptly so up to a minute of
@@ -1407,9 +1463,10 @@ void TaskTelemetry(void *pvParameters) {
                 RuntimeConfig localCfg = snapshotConfig();
 
                 snprintf(bleBuffer, sizeof(bleBuffer),
-                    "{\"S\":1,\"pR\":%.1f,\"oP\":%.2f,\"sP\":%.2f,\"oV\":%.2f,\"tB\":%.2f,\"lB\":%.2f,\"kP\":%.1f,\"kI\":%.1f,\"kD\":%.1f,\"tW\":%d,\"tA\":%d,\"tR\":%d,\"eH\":%.2f,\"vP\":%.2f,\"lA\":%.3f}\n",
+                    "{\"S\":1,\"pR\":%.1f,\"oP\":%.2f,\"sP\":%.2f,\"oV\":%.2f,\"tB\":%.2f,\"lB\":%.2f,\"sL\":%.2f,\"hL\":%.2f,\"kP\":%.1f,\"kI\":%.1f,\"kD\":%.1f,\"tW\":%d,\"tA\":%d,\"tR\":%d,\"eH\":%.2f,\"vP\":%.2f,\"lA\":%.3f}\n",
                     localCfg.pulsesPerRev, localCfg.offsetPIM, localCfg.scalePIM, localCfg.offsetVTA,
-                    localCfg.targetBoost, localCfg.limitBoostBar, pid.kP, pid.kI, pid.kD,
+                    localCfg.targetBoost, localCfg.limitBoostBar, localCfg.softLimpBar, localCfg.hardLimpBar,
+                    pid.kP, pid.kI, pid.kD,
                     localCfg.tireW, localCfg.tireA, localCfg.tireR,
                     stationaryEngineHours, localCfg.vssPulsesPerRev, pid.learnCoeff
                 );
@@ -1506,6 +1563,8 @@ void TaskOdometerAndStorage(void *pvParameters) {
                 prefs.putInt("tA", cfg.tireA);
                 prefs.putInt("tR", cfg.tireR);
                 prefs.putFloat("lB", cfg.limitBoostBar);
+                prefs.putFloat("sL", cfg.softLimpBar);
+                prefs.putFloat("hL", cfg.hardLimpBar);
                 xSemaphoreGive(configMutex);
                 settingsNeedsSaving = false;
                 forceSettingsSaveRequested = false;
@@ -1642,6 +1701,8 @@ void setup() {
         cfg.tireA = constrain(prefs.getInt("tA", 55), 20, 100);
         cfg.tireR = constrain(prefs.getInt("tR", 15), 10, 24);
         cfg.limitBoostBar = constrainFloat(prefs.getFloat("lB", 0.95f), 0.3f, 2.0f);
+        cfg.softLimpBar = constrainFloat(prefs.getFloat("sL", SOFT_LIMP_BOOST_BAR), 0.5f, 2.0f);
+        cfg.hardLimpBar = constrainFloat(prefs.getFloat("hL", HARD_LIMP_BOOST_BAR), 0.5f, 2.5f);
         calcWheelSizeLocked();
         pid.kP = constrainFloat(prefs.getFloat("kP", DEFAULT_KP), 0.0f, 200.0f);
         pid.kI = constrainFloat(prefs.getFloat("kI", DEFAULT_KI), 0.0f, 200.0f);

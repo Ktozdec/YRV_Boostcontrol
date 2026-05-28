@@ -7,7 +7,8 @@
       "Bash(export PATH=\"$JAVA_HOME/bin:$PATH\")",
       "Bash(echo \"exit=$?\")",
       "PowerShell($f = Get-Command ffmpeg.exe -ErrorAction SilentlyContinue; if \\($f\\) { $f.Source } else { \"ffmpeg: not found\" }; $p = Get-Command python.exe -ErrorAction SilentlyContinue; if \\($p\\) { \"python: \" + $p.Source } else { \"python: not found\" }; $py = Get-Command py.exe -ErrorAction SilentlyContinue; if \\($py\\) { \"py: \" + $py.Source } else { \"py: not found\" })",
-      "Bash(grep -iE \"\\\\.\\(kt|java\\)$\")"
+      "Bash(grep -iE \"\\\\.\\(kt|java\\)$\")",
+      "Bash(powershell -Command \"\\(Get-Content 'C:\\\\Users\\\\79778\\\\AppData\\\\Local\\\\Temp\\\\12.1 \\(1\\).csv' | Measure-Object -Line\\).Lines\")"
     ]
   }
 }

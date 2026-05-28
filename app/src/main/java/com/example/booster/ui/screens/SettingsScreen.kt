@@ -71,6 +71,8 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
     var testDutySlider by remember { mutableFloatStateOf(0f) }
     var draftTb by remember { mutableFloatStateOf(0f) }
     var draftLb by remember { mutableFloatStateOf(0f) }
+    var draftSl by remember { mutableFloatStateOf(0f) }
+    var draftHl by remember { mutableFloatStateOf(0f) }
     var draftKp by remember { mutableFloatStateOf(0f) }
     var draftKi by remember { mutableFloatStateOf(0f) }
     var draftKd by remember { mutableFloatStateOf(0f) }
@@ -91,6 +93,8 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         if (!isInitialized && data.targetBoost != 0f) {
             draftTb = data.targetBoost
             draftLb = data.limitBoostBar
+            draftSl = data.softLimpBar
+            draftHl = data.hardLimpBar
             draftKp = data.kP
             draftKi = data.kI
             draftKd = data.kD
@@ -160,6 +164,13 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         }
 
         item {
+            SettingsCard(title = "Защита от передува (Limp)") {
+                TuneRow("Soft limp — дьюти 20% (бар)", draftSl, 0.05f, "%.2f", 0.5f, 2.0f) { draftSl = it }
+                TuneRow("Hard limp — дьюти 0% (бар)", draftHl, 0.05f, "%.2f", 0.5f, 2.5f) { draftHl = it }
+            }
+        }
+
+        item {
             SettingsCard(title = "ПИД-регулятор и обучение") {
                 TuneRow("Proportional (kP)", draftKp, 1.0f, "%.1f", 0f, 200f) { draftKp = it }
                 TuneRow("Integral (kI)", draftKi, 1.0f, "%.1f", 0f, 200f) { draftKi = it }
@@ -206,6 +217,10 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                         viewModel.sendCommand("SET:tB:${fmt(clampValue(draftTb, 0.3f, 1.5f), "%.2f")}")
                         delay(30)
                         viewModel.sendCommand("SET:lB:${fmt(clampValue(draftLb, 0.3f, 2.0f), "%.2f")}")
+                        delay(30)
+                        viewModel.sendCommand("SET:sL:${fmt(clampValue(draftSl, 0.5f, 2.0f), "%.2f")}")
+                        delay(30)
+                        viewModel.sendCommand("SET:hL:${fmt(clampValue(draftHl, 0.5f, 2.5f), "%.2f")}")
                         delay(30)
                         viewModel.sendCommand("SET:kP:${fmt(clampValue(draftKp, 0f, 200f), "%.1f")}")
                         delay(30)
