@@ -176,6 +176,31 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                 TuneRow("Integral (kI)", draftKi, 1.0f, "%.1f", 0f, 200f) { draftKi = it }
                 TuneRow("Derivative (kD)", draftKd, 1.0f, "%.1f", 0f, 50f) { draftKd = it }
                 TuneRow("Скорость адаптации карты (lA)", draftLa, 0.01f, "%.2f", 0.02f, 0.30f) { draftLa = it }
+                Spacer(Modifier.height(8.dp))
+                Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        onClick = {
+                            draftLa = 0.30f
+                            viewModel.sendCommand("SET:lA:0.30")
+                        },
+                        modifier = Modifier.weight(1f).height(44.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = BoostRed.copy(alpha = 0.85f))
+                    ) {
+                        Text("ОБУЧЕНИЕ", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = NeonWhite)
+                    }
+                    Button(
+                        onClick = {
+                            draftLa = 0.10f
+                            viewModel.sendCommand("SET:lA:0.10")
+                        },
+                        modifier = Modifier.weight(1f).height(44.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2C2C2E))
+                    ) {
+                        Text("НОРМА", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = TextGray)
+                    }
+                }
             }
         }
 

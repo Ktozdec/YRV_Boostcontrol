@@ -58,10 +58,13 @@ constexpr bool DAC_OUTPUT_ENABLED = true;
 constexpr float DEFAULT_KP = 28.0f;
 constexpr float DEFAULT_KI = 16.0f;
 constexpr float DEFAULT_KD = 10.0f;
-constexpr float INTEGRAL_LIMIT      = 15.0f;   // anti-windup clamp on the integral term (% duty)
-constexpr float INTEGRAL_BAND       = 0.15f;   // integrate ONLY within this |error| (bar) of target;
-                                               // outside it P + feed-forward do the gross work, so the
-                                               // integral can't wind up during the spool ramp → no overshoot.
+constexpr float INTEGRAL_LIMIT      = 25.0f;   // anti-windup clamp on the integral term (% duty)
+constexpr float AW_TRACK_TAU_S      = 0.30f;   // back-calculation (tracking) anti-windup time constant.
+                                               // When the commanded duty saturates at MAP_DUTY_MIN/MAX, the
+                                               // integrator is "un-wound" toward the achievable value over
+                                               // ~this time, so it stops growing while saturated but stays
+                                               // fully active near the setpoint (no deadband trap → no
+                                               // permanent under/overboost, and the autotune keeps learning).
 constexpr float TARGET_FILTER_TAU_S = 0.35f;   // smoothing time constant for the boost target
 
 // -- Actuator slew limiting --
@@ -1312,24 +1315,21 @@ void TaskControl(void *pvParameters) {
             // Setpoint feed-forward: anticipate a rising target to spool faster (help only, never fight).
             float setpointFF = constrainFloat(targetRate * SETPOINT_FF_GAIN, 0.0f, SETPOINT_FF_CAP);
 
-            // F3: conditional-integration anti-windup. Form the candidate integral, build the
-            // output, and only commit the integral if we are not driving further into saturation.
-            // Setpoint-band gate: integrate ONLY when boost is already close to target (|err| <
-            // INTEGRAL_BAND). During the spool ramp the error is large, so the integral is frozen and
-            // cannot wind up — that windup was the main cause of the post-spool overshoot. Near the
-            // target the integral resumes and trims out the steady-state offset like before.
-            bool nearSetpoint = fabs(err) < INTEGRAL_BAND;
-            float integralCandidate = nearSetpoint
-                ? constrainFloat(pid.integral + err * kiEff * dt, -INTEGRAL_LIMIT, INTEGRAL_LIMIT)
-                : pid.integral;
-            float dutyUnclamped = currentBaseDuty + (err * kpEff) + integralCandidate + (pid.filteredDerivative * kdEff) + setpointFF;
-            bool pushingIntoHigh = dutyUnclamped > MAP_DUTY_MAX && err > 0.0f;
-            bool pushingIntoLow  = dutyUnclamped < MAP_DUTY_MIN && err < 0.0f;
-            if (nearSetpoint && !pushingIntoHigh && !pushingIntoLow) {
-                pid.integral = integralCandidate;     // accept; otherwise freeze (no abrupt *0.9 kicks)
-            }
+            // Back-calculation (tracking) anti-windup. Integrate EVERY cycle — no setpoint-band gate
+            // (the old INTEGRAL_BAND froze the integrator whenever |err| exceeded the band, which on a
+            // cold/cool map left a permanent steady-state offset it could never trim out → underboost
+            // trap, and starved the autotune). To stop windup while the output is saturated, we form the
+            // unclamped output, clamp it to the actuator range, and feed the saturation excess
+            // (dutyClamped - dutyUnclamped) back into the integrator over AW_TRACK_TAU_S. While saturated
+            // the integrator "tracks" the achievable value instead of growing; near the setpoint the
+            // correction is ~0 so the integrator works normally and eliminates the offset.
+            float integralRaw = pid.integral + err * kiEff * dt;
+            float dutyUnclamped = currentBaseDuty + (err * kpEff) + integralRaw + (pid.filteredDerivative * kdEff) + setpointFF;
+            float dutyClamped = constrainFloat(dutyUnclamped, MAP_DUTY_MIN, MAP_DUTY_MAX);
+            integralRaw += (dutyClamped - dutyUnclamped) * (dt / AW_TRACK_TAU_S);
+            pid.integral = constrainFloat(integralRaw, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
 
-            currentOutDuty = constrainFloat(dutyUnclamped, MAP_DUTY_MIN, MAP_DUTY_MAX);
+            currentOutDuty = dutyClamped;
 
             // Soft limp: instead of slamming duty to a fixed 20% step (which collapsed spool and set
             // up the boost oscillation), bleed the PID output down PROPORTIONALLY to how far boost has
