@@ -76,6 +76,9 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
     var draftKp by remember { mutableFloatStateOf(0f) }
     var draftKi by remember { mutableFloatStateOf(0f) }
     var draftKd by remember { mutableFloatStateOf(0f) }
+    var draftBh by remember { mutableFloatStateOf(0f) }
+    var draftBl by remember { mutableFloatStateOf(0f) }
+    var draftFs by remember { mutableFloatStateOf(0f) }
     var draftOp by remember { mutableFloatStateOf(0f) }
     var draftSp by remember { mutableFloatStateOf(0f) }
     var draftPr by remember { mutableFloatStateOf(0f) }
@@ -98,6 +101,9 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
             draftKp = data.kP
             draftKi = data.kI
             draftKd = data.kD
+            draftBh = data.spoolBlendHigh
+            draftBl = data.spoolBlendLow
+            draftFs = data.dutyFallSlew
             draftOp = data.offsetMap
             draftSp = data.scaleMap
             draftOv = data.offsetTps
@@ -205,6 +211,21 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         }
 
         item {
+            SettingsCard(title = "Раздув (Spool)") {
+                Text(
+                    "Открытый дьюти на раздуве: чем больше дефицит до таргета, тем выше дьюти (до 95% — кратковременно). У таргета плавно спускается к ПИД. Потолок 95% задан в прошивке.",
+                    color = TextGray,
+                    fontSize = 12.sp,
+                    letterSpacing = 0.3.sp,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                TuneRow("Полный раздув при дефиците (бар)", draftBh, 0.05f, "%.2f", 0.05f, 1.0f) { draftBh = it }
+                TuneRow("Конец раздува у таргета (бар)", draftBl, 0.01f, "%.2f", 0.0f, 0.5f) { draftBl = it }
+                TuneRow("Скорость спуска дьюти (%/с)", draftFs, 25f, "%.0f", 50f, 1000f) { draftFs = it }
+            }
+        }
+
+        item {
             SettingsCard(title = "Калибровки датчиков") {
                 TuneRow("Ноль MAP (oP)", draftOp, 0.01f, "%.2f", 0.1f, 4.5f) { draftOp = it }
                 TuneRow("Множ. MAP (sP)", draftSp, 0.01f, "%.2f", 0.1f, 2.0f) { draftSp = it }
@@ -254,6 +275,12 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                         viewModel.sendCommand("SET:kD:${fmt(clampValue(draftKd, 0f, 50f), "%.1f")}")
                         delay(30)
                         viewModel.sendCommand("SET:lA:${fmt(clampValue(draftLa, 0.02f, 0.30f), "%.2f")}")
+                        delay(30)
+                        viewModel.sendCommand("SET:bH:${fmt(clampValue(draftBh, 0.05f, 1.0f), "%.2f")}")
+                        delay(30)
+                        viewModel.sendCommand("SET:bL:${fmt(clampValue(draftBl, 0.0f, 0.5f), "%.2f")}")
+                        delay(30)
+                        viewModel.sendCommand("SET:fS:${fmt(clampValue(draftFs, 50f, 1000f), "%.0f")}")
                         delay(30)
                         viewModel.sendCommand("SET:oP:${fmt(clampValue(draftOp, 0.1f, 4.5f), "%.2f")}")
                         delay(30)

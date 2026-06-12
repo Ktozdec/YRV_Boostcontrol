@@ -36,12 +36,15 @@ constexpr uint16_t ADS1115_CFG_BASE =
     ADS1115_CFG_MODE_SINGLE |
     ADS1115_CFG_DR_860 |
     ADS1115_CFG_COMP_DISABLE;
-constexpr float SOFT_LIMP_BOOST_BAR = 1.15f;   // power-on default for cfg.softLimpBar (runtime-tunable)
-constexpr float HARD_LIMP_BOOST_BAR = 1.30f;   // power-on default for cfg.hardLimpBar (runtime-tunable)
+// Soft/Hard limp are NOT independently tunable: they are ALWAYS derived from the boost target —
+// soft = target + 0.15 bar, hard = target + 0.20 bar — so the protection band tracks the target
+// automatically and stays a fixed margin above it (see recomputeLimpThresholdsLocked()).
+constexpr float SOFT_LIMP_TARGET_OFFSET = 0.15f;
+constexpr float HARD_LIMP_TARGET_OFFSET = 0.20f;
 
 // =============================== ADAPTIVE TUNING ===============================
 // One place for the knobs that shape boost behaviour and self-learning.
-// (Protection thresholds are SOFT_LIMP_BOOST_BAR / HARD_LIMP_BOOST_BAR above.)
+// (Protection thresholds are derived from the target: soft = target + 0.15, hard = target + 0.20 — see above.)
 
 // -- Control loop timing & robustness --
 constexpr uint32_t CONTROL_PERIOD_MS = 50;     // 20 Hz. 10 ms (100 Hz) starved the software tach ISR → RPM read half. Keep at 50.
@@ -55,9 +58,9 @@ constexpr uint32_t MAP_SAVE_INTERVAL_MS = 60000; // NVS map flush no more than o
 constexpr bool DAC_OUTPUT_ENABLED = true;
 
 // -- PID base gains (also power-on defaults; a saved value in NVS overrides them) --
-constexpr float DEFAULT_KP = 28.0f;
-constexpr float DEFAULT_KI = 16.0f;
-constexpr float DEFAULT_KD = 10.0f;
+constexpr float DEFAULT_KP = 20.0f;   // was 28 — kill plateau hunting (not down to 18: target is close, don't go sluggish)
+constexpr float DEFAULT_KI = 14.0f;   // was 16 — keep integral authority (needed to hold the target)
+constexpr float DEFAULT_KD = 8.0f;    // was 10 — measurement is noisy, don't amplify it
 constexpr float INTEGRAL_LIMIT      = 25.0f;   // anti-windup clamp on the integral term (% duty)
 constexpr float AW_TRACK_TAU_S      = 0.30f;   // back-calculation (tracking) anti-windup time constant.
                                                // When the commanded duty saturates at MAP_DUTY_MIN/MAX, the
@@ -73,6 +76,21 @@ constexpr float TARGET_FILTER_TAU_S = 0.35f;   // smoothing time constant for th
 // loop period). Generous enough that it does not choke spool (≈full 0-100% sweep in ~0.5 s), but it
 // removes the abrupt steps that set up hunting. HARD_LIMP bypasses this — protection stays instant.
 constexpr float DUTY_SLEW_PER_S = 200.0f;
+
+// -- Open-loop spool assist (transient) --
+// On a hard tip-in the PID + slew ramp duty up too gently and only back off AFTER boost has already
+// overshot. This commands a high OPEN-LOOP duty while boost is far below target (tight, dense spool),
+// then crossfades back down to the PID value BEFORE the target is reached, so turbo momentum doesn't
+// carry past it. SPOOL_DUTY_MAX is a TRANSIENT ceiling only (engaged for the brief spool); the
+// steady-state duty still tops out at MAP_DUTY_MAX (85%) — the solenoid sticks/overheats if HELD
+// above ~85%, but a short spool spike to 95% is safe. The crossfade thresholds (spoolBlendHigh/Low)
+// and the downward slew (dutyFallSlewPerS) are runtime-tunable over BLE (see RuntimeConfig).
+constexpr float SPOOL_DUTY_MAX        = 95.0f;   // transient-only spool duty ceiling (NOT sustained — do not raise MAP_DUTY_MAX)
+constexpr float DUTY_RISE_SLEW_PER_S  = 800.0f;  // fast rise so spool isn't choked; the fall rate is cfg.dutyFallSlewPerS
+constexpr float SPOOL_BLEND_HIGH_DEF  = 0.15f;   // power-on default: softer handover — the latch prevents re-firing, so no need to start the assist 0.30 bar out
+constexpr float SPOOL_BLEND_LOW_DEF   = 0.03f;   // power-on default: crisp latch trip right at the target
+constexpr float DUTY_FALL_SLEW_DEF    = 150.0f;  // power-on default: downward duty slew (%/s)
+constexpr float SPOOL_FREEZE_BLEND    = 0.05f;   // freeze the integrator while blend exceeds this (no windup on PID handover)
 
 // -- Self-learning (adaptive feed-forward map) --
 constexpr float DEFAULT_LEARN_RATE  = 0.10f;   // lA: fraction of the steady integral bias baked into the map per update
@@ -107,7 +125,7 @@ constexpr float GAIN_RPM_HIGH = 6000.0f;
 const float ATMOS_MIN_VOLTS    = 2.40f;
 const float ATMOS_MAX_VOLTS    = 2.70f;
 const float DEFAULT_OFFSET     = 2.57f;
-const float DAC_REFERENCE_VOLTAGE = 5.02f;
+const float DAC_REFERENCE_VOLTAGE = 4.99f;   // measured VDD on the 5V rail (MCP4725 output is ratiometric to VDD)
 
 const float FILTER_NEW = 0.70f;
 const float FILTER_OLD = 0.30f;
@@ -141,7 +159,6 @@ const int klineTxPin = 17;
 const int pwmFreq = 30;
 const int pwmRes = 8;
 volatile int testDuty = 0;
-volatile float latchedGearBoostTrim = 0.20f;
 
 struct PID_Config {
     float kP = DEFAULT_KP;
@@ -161,8 +178,11 @@ struct RuntimeConfig {
     float offsetVTA = 0.42f;
     float targetBoost = 0.80f;
     float limitBoostBar = 0.95f;
-    float softLimpBar = SOFT_LIMP_BOOST_BAR;   // boost above this clamps duty to 20% (soft cut)
-    float hardLimpBar = HARD_LIMP_BOOST_BAR;   // boost above this drops duty to 0% (hard cut)
+    float softLimpBar = 0.95f;   // DERIVED at runtime = targetBoost + 0.15 (recomputeLimpThresholdsLocked); proportional duty bleed above this
+    float hardLimpBar = 1.00f;   // DERIVED at runtime = targetBoost + 0.20; duty drops to 0% above this
+    float spoolBlendHigh = SPOOL_BLEND_HIGH_DEF;   // boost deficit (bar) for full open-loop spool assist
+    float spoolBlendLow  = SPOOL_BLEND_LOW_DEF;    // deficit (bar) where the spool assist fades to pure PID
+    float dutyFallSlewPerS = DUTY_FALL_SLEW_DEF;   // downward duty slew rate (%/s); rise is DUTY_RISE_SLEW_PER_S
     float vssPulsesPerRev = 5.18f;
     int tireW = 195;
     int tireA = 55;
@@ -284,15 +304,6 @@ bool isFiniteFloat(float value) {
     return !isnan(value) && !isinf(value);
 }
 
-float computeGearBoostTrim(float rpm, float speed, float previousTrim) {
-    if (speed <= 10.0f) return 0.20f;
-
-    const float gearRatio = rpm / max(speed, 1.0f);
-
-    if (gearRatio > 105.0f) return 0.20f;
-    return 0.0f;
-}
-
 bool parseIntStrict(const String &s, int minV, int maxV, int &out) {
     char *end = nullptr;
     long v = strtol(s.c_str(), &end, 10);
@@ -331,6 +342,13 @@ void notifyStorageTask() {
 void calcWheelSizeLocked() {
     float diameterMm = (cfg.tireR * 25.4f) + 2.0f * (cfg.tireW * (cfg.tireA / 100.0f));
     cfg.wheelSizeM = (diameterMm * PI) / 1000.0f;
+}
+
+// Soft/Hard limp thresholds always sit a fixed margin above the boost target (soft = target + 0.15,
+// hard = target + 0.20). Call this after any change to cfg.targetBoost. Caller must hold configMutex.
+void recomputeLimpThresholdsLocked() {
+    cfg.softLimpBar = cfg.targetBoost + SOFT_LIMP_TARGET_OFFSET;
+    cfg.hardLimpBar = cfg.targetBoost + HARD_LIMP_TARGET_OFFSET;
 }
 
 void sanitizeMapProfileLocked() {
@@ -785,7 +803,10 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
         if (ok) cfg.offsetVTA = fValue;
     } else if (key == "tB") {
         ok = parseFloatStrict(rawValue, 0.3f, 1.5f, fValue);
-        if (ok) cfg.targetBoost = fValue;
+        if (ok) {
+            cfg.targetBoost = fValue;
+            recomputeLimpThresholdsLocked();   // keep soft/hard limp at target + 0.15 / + 0.20
+        }
     } else if (key == "kP") {
         ok = parseFloatStrict(rawValue, 0.0f, 200.0f, fValue);
         if (ok) pid.kP = fValue;
@@ -834,12 +855,21 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
     } else if (key == "lB") {
         ok = parseFloatStrict(rawValue, 0.3f, 2.0f, fValue);
         if (ok) cfg.limitBoostBar = fValue;
-    } else if (key == "sL") {
-        ok = parseFloatStrict(rawValue, 0.5f, 2.0f, fValue);
-        if (ok) cfg.softLimpBar = fValue;
-    } else if (key == "hL") {
-        ok = parseFloatStrict(rawValue, 0.5f, 2.5f, fValue);
-        if (ok) cfg.hardLimpBar = fValue;
+    } else if (key == "sL" || key == "hL") {
+        // Soft/Hard limp can no longer be set directly — they are derived from the target
+        // (target + 0.15 / + 0.20). Accept the legacy key without error (the app still sends it),
+        // but ignore the value and re-derive so the band always tracks the target.
+        recomputeLimpThresholdsLocked();
+        ok = true;
+    } else if (key == "bH") {
+        ok = parseFloatStrict(rawValue, 0.05f, 1.0f, fValue);
+        if (ok) cfg.spoolBlendHigh = fValue;
+    } else if (key == "bL") {
+        ok = parseFloatStrict(rawValue, 0.0f, 0.5f, fValue);
+        if (ok) cfg.spoolBlendLow = fValue;
+    } else if (key == "fS") {
+        ok = parseFloatStrict(rawValue, 50.0f, 1000.0f, fValue);
+        if (ok) cfg.dutyFallSlewPerS = fValue;
     } else {
         ok = false;
         error = "unknown_key";
@@ -1224,8 +1254,6 @@ void TaskSensors(void *pvParameters) {
             smoothedSpeed = smoothedSpeed * 0.7f + instSpeed * 0.3f;
             if (smoothedSpeed < 2.0f && frequencyHz == 0.0f) smoothedSpeed = 0.0f;
 
-            float nextGearTrim = computeGearBoostTrim(medRPM, smoothedSpeed, latchedGearBoostTrim);
-            latchedGearBoostTrim = nextGearTrim;
             lastSpdCalcMs = nowMs;
         }
 
@@ -1273,9 +1301,8 @@ void TaskControl(void *pvParameters) {
         if (dt <= 0.0002f || dt > 0.5f) dt = CONTROL_PERIOD_MS / 1000.0f;
         lastPidMicros = nowUs;
 
-        float targetTrim = latchedGearBoostTrim;
         float shapedTarget = localCfg.targetBoost * getTargetShape(d.rpm);
-        float desiredDynamicTarget = constrainFloat(shapedTarget - targetTrim, 0.30f, localCfg.targetBoost);
+        float desiredDynamicTarget = constrainFloat(shapedTarget, 0.30f, localCfg.targetBoost);
         if (!filteredDynamicTargetInitialized) {
             filteredDynamicTarget = desiredDynamicTarget;
             filteredDynamicTargetInitialized = true;
@@ -1287,6 +1314,13 @@ void TaskControl(void *pvParameters) {
         float dynamicTarget = filteredDynamicTarget;
         float targetRate = (dynamicTarget - prevControlTarget) / dt;   // bar/s, smooth (target is low-passed)
         prevControlTarget = dynamicTarget;
+
+        // One-shot spool latch: the open-loop assist must fire only on the genuine spool-up, not re-arm
+        // every time boost dips below target during regulation. Re-firing slammed duty back to ~95% on
+        // each dip and set up a boost/duty limit cycle (logged: boost 1.06→0.75→0.99 hunting, duty
+        // 47→95→54). spoolArmed latches OFF once boost first reaches the target band (below) and re-arms
+        // on pedal lift (else branch), so a fresh throttle application / post-shift gets a full spool.
+        static bool spoolArmed = true;
 
         if (systemMode != HARD_LIMP && d.tps > 10.0f && d.rpm >= 1300.0f) {
             float err = dynamicTarget - d.boost;
@@ -1315,6 +1349,19 @@ void TaskControl(void *pvParameters) {
             // Setpoint feed-forward: anticipate a rising target to spool faster (help only, never fight).
             float setpointFF = constrainFloat(targetRate * SETPOINT_FF_GAIN, 0.0f, SETPOINT_FF_CAP);
 
+            // Open-loop spool assist: how far below target are we (bar)? blend = 1 when the deficit is
+            // large (full assist → command SPOOL_DUTY_MAX), fading to 0 as boost nears the target so we
+            // hand smoothly back to the PID. This is what makes spool dense AND tames the overshoot:
+            // the duty starts easing down BEFORE the target instead of after boost has already shot past.
+            float spoolDeficit = dynamicTarget - d.boost;
+            float spoolSpan = max(localCfg.spoolBlendHigh - localCfg.spoolBlendLow, 0.01f);
+            float spoolBlend = constrainFloat((spoolDeficit - localCfg.spoolBlendLow) / spoolSpan, 0.0f, 1.0f);
+            // Latch the assist off the moment boost first reaches the target band; from then on the PID
+            // regulates alone for the rest of this pull (a momentary dip no longer re-slams 95% duty).
+            if (spoolDeficit < localCfg.spoolBlendLow) spoolArmed = false;
+            float effSpoolBlend = spoolArmed ? spoolBlend : 0.0f;
+            bool spoolAssisting = effSpoolBlend > SPOOL_FREEZE_BLEND;
+
             // Back-calculation (tracking) anti-windup. Integrate EVERY cycle — no setpoint-band gate
             // (the old INTEGRAL_BAND froze the integrator whenever |err| exceeded the band, which on a
             // cold/cool map left a permanent steady-state offset it could never trim out → underboost
@@ -1323,13 +1370,21 @@ void TaskControl(void *pvParameters) {
             // (dutyClamped - dutyUnclamped) back into the integrator over AW_TRACK_TAU_S. While saturated
             // the integrator "tracks" the achievable value instead of growing; near the setpoint the
             // correction is ~0 so the integrator works normally and eliminates the offset.
-            float integralRaw = pid.integral + err * kiEff * dt;
+            // While the open-loop spool assist dominates, freeze fresh integration (kiThisCycle = 0) so
+            // the integrator doesn't wind up behind the 95% open-loop duty and overshoot on handover —
+            // the back-calc term still runs, letting it settle to the achievable bias.
+            float kiThisCycle = spoolAssisting ? 0.0f : kiEff;
+            float integralRaw = pid.integral + err * kiThisCycle * dt;
             float dutyUnclamped = currentBaseDuty + (err * kpEff) + integralRaw + (pid.filteredDerivative * kdEff) + setpointFF;
             float dutyClamped = constrainFloat(dutyUnclamped, MAP_DUTY_MIN, MAP_DUTY_MAX);
             integralRaw += (dutyClamped - dutyUnclamped) * (dt / AW_TRACK_TAU_S);
             pid.integral = constrainFloat(integralRaw, -INTEGRAL_LIMIT, INTEGRAL_LIMIT);
 
-            currentOutDuty = dutyClamped;
+            // Crossfade the PID duty (≤ MAP_DUTY_MAX) up toward the transient spool ceiling. max() keeps
+            // it assist-only: we never pull BELOW what the PID asks. Above target spoolBlend is 0, so
+            // this collapses to the plain PID output and the soft-limp bleed below behaves as before.
+            float spoolTargetDuty = (1.0f - effSpoolBlend) * dutyClamped + effSpoolBlend * SPOOL_DUTY_MAX;
+            currentOutDuty = max(dutyClamped, spoolTargetDuty);
 
             // Soft limp: instead of slamming duty to a fixed 20% step (which collapsed spool and set
             // up the boost oscillation), bleed the PID output down PROPORTIONALLY to how far boost has
@@ -1366,6 +1421,9 @@ void TaskControl(void *pvParameters) {
             pid.lastMeas = d.boost;
             lastMeasMicros = nowUs;
             pid.filteredDerivative = 0.0f;
+            // Pedal lifted / idle: re-arm the spool latch so the next throttle application (or the
+            // next gear after a shift) gets a fresh full open-loop spool.
+            spoolArmed = true;
             // Hard limp or genuine idle (low TPS/RPM): solenoid fully released, wastegate open.
             // Soft limp now stays in the PID branch above and bleeds down smoothly instead.
             currentOutDuty = 0.0f;
@@ -1378,8 +1436,11 @@ void TaskControl(void *pvParameters) {
         if (systemMode == HARD_LIMP) {
             slewLimitedDuty = 0.0f;
         } else {
-            float maxStep = DUTY_SLEW_PER_S * dt;
-            slewLimitedDuty += constrainFloat(currentOutDuty - slewLimitedDuty, -maxStep, maxStep);
+            // Asymmetric: rise fast (DUTY_RISE_SLEW_PER_S) so the spool isn't choked; fall at the
+            // tunable cfg.dutyFallSlewPerS so the proactive spool back-off stays controlled.
+            float riseStep = DUTY_RISE_SLEW_PER_S * dt;
+            float fallStep = localCfg.dutyFallSlewPerS * dt;
+            slewLimitedDuty += constrainFloat(currentOutDuty - slewLimitedDuty, -fallStep, riseStep);
         }
         currentOutDuty = slewLimitedDuty;
 
@@ -1463,12 +1524,13 @@ void TaskTelemetry(void *pvParameters) {
                 RuntimeConfig localCfg = snapshotConfig();
 
                 snprintf(bleBuffer, sizeof(bleBuffer),
-                    "{\"S\":1,\"pR\":%.1f,\"oP\":%.2f,\"sP\":%.2f,\"oV\":%.2f,\"tB\":%.2f,\"lB\":%.2f,\"sL\":%.2f,\"hL\":%.2f,\"kP\":%.1f,\"kI\":%.1f,\"kD\":%.1f,\"tW\":%d,\"tA\":%d,\"tR\":%d,\"eH\":%.2f,\"vP\":%.2f,\"lA\":%.3f}\n",
+                    "{\"S\":1,\"pR\":%.1f,\"oP\":%.2f,\"sP\":%.2f,\"oV\":%.2f,\"tB\":%.2f,\"lB\":%.2f,\"sL\":%.2f,\"hL\":%.2f,\"kP\":%.1f,\"kI\":%.1f,\"kD\":%.1f,\"tW\":%d,\"tA\":%d,\"tR\":%d,\"eH\":%.2f,\"vP\":%.2f,\"lA\":%.3f,\"bH\":%.2f,\"bL\":%.2f,\"fS\":%.0f}\n",
                     localCfg.pulsesPerRev, localCfg.offsetPIM, localCfg.scalePIM, localCfg.offsetVTA,
                     localCfg.targetBoost, localCfg.limitBoostBar, localCfg.softLimpBar, localCfg.hardLimpBar,
                     pid.kP, pid.kI, pid.kD,
                     localCfg.tireW, localCfg.tireA, localCfg.tireR,
-                    stationaryEngineHours, localCfg.vssPulsesPerRev, pid.learnCoeff
+                    stationaryEngineHours, localCfg.vssPulsesPerRev, pid.learnCoeff,
+                    localCfg.spoolBlendHigh, localCfg.spoolBlendLow, localCfg.dutyFallSlewPerS
                 );
                 sendBleText(bleBuffer);
                 vTaskDelay(pdMS_TO_TICKS(SETTINGS_RESEND_INTERVAL_MS));
@@ -1565,6 +1627,9 @@ void TaskOdometerAndStorage(void *pvParameters) {
                 prefs.putFloat("lB", cfg.limitBoostBar);
                 prefs.putFloat("sL", cfg.softLimpBar);
                 prefs.putFloat("hL", cfg.hardLimpBar);
+                prefs.putFloat("bH", cfg.spoolBlendHigh);
+                prefs.putFloat("bL", cfg.spoolBlendLow);
+                prefs.putFloat("fS", cfg.dutyFallSlewPerS);
                 xSemaphoreGive(configMutex);
                 settingsNeedsSaving = false;
                 forceSettingsSaveRequested = false;
@@ -1701,8 +1766,10 @@ void setup() {
         cfg.tireA = constrain(prefs.getInt("tA", 55), 20, 100);
         cfg.tireR = constrain(prefs.getInt("tR", 15), 10, 24);
         cfg.limitBoostBar = constrainFloat(prefs.getFloat("lB", 0.95f), 0.3f, 2.0f);
-        cfg.softLimpBar = constrainFloat(prefs.getFloat("sL", SOFT_LIMP_BOOST_BAR), 0.5f, 2.0f);
-        cfg.hardLimpBar = constrainFloat(prefs.getFloat("hL", HARD_LIMP_BOOST_BAR), 0.5f, 2.5f);
+        recomputeLimpThresholdsLocked();   // soft/hard limp are derived from target (+0.15 / +0.20), not loaded
+        cfg.spoolBlendHigh = constrainFloat(prefs.getFloat("bH", SPOOL_BLEND_HIGH_DEF), 0.05f, 1.0f);
+        cfg.spoolBlendLow  = constrainFloat(prefs.getFloat("bL", SPOOL_BLEND_LOW_DEF), 0.0f, 0.5f);
+        cfg.dutyFallSlewPerS = constrainFloat(prefs.getFloat("fS", DUTY_FALL_SLEW_DEF), 50.0f, 1000.0f);
         calcWheelSizeLocked();
         pid.kP = constrainFloat(prefs.getFloat("kP", DEFAULT_KP), 0.0f, 200.0f);
         pid.kI = constrainFloat(prefs.getFloat("kI", DEFAULT_KI), 0.0f, 200.0f);
@@ -1742,6 +1809,26 @@ void setup() {
             prefs.remove("samples2D");
             prefs.putInt("tuneVer", 7);
         }
+
+        // v8 migration: new base tune — calmer plateau PID (kP 28→20, kI 16→14, kD 10→8) and a softer
+        // spool handover (bH→0.15, bL→0.03, fS→150). Force these once over stale NVS values so the new
+        // tune is live after flashing without a manual reset; the app can still fine-tune afterwards and
+        // the changes persist. The learned duty map is left intact (this only retunes gains/crossfade).
+        if (prefs.getInt("tuneVer", 0) < 8) {
+            pid.kP = DEFAULT_KP;
+            pid.kI = DEFAULT_KI;
+            pid.kD = DEFAULT_KD;
+            cfg.spoolBlendHigh   = SPOOL_BLEND_HIGH_DEF;
+            cfg.spoolBlendLow    = SPOOL_BLEND_LOW_DEF;
+            cfg.dutyFallSlewPerS = DUTY_FALL_SLEW_DEF;
+            prefs.putFloat("kP", pid.kP);
+            prefs.putFloat("kI", pid.kI);
+            prefs.putFloat("kD", pid.kD);
+            prefs.putFloat("bH", cfg.spoolBlendHigh);
+            prefs.putFloat("bL", cfg.spoolBlendLow);
+            prefs.putFloat("fS", cfg.dutyFallSlewPerS);
+            prefs.putInt("tuneVer", 8);
+        }
         xSemaphoreGive(configMutex);
     }
 
@@ -1773,7 +1860,7 @@ void setup() {
     ads.setDataRate(RATE_ADS1115_860SPS);
 
     Serial.println("Step: MCP4725 begin...");
-    dac.begin(0x60);   // MCP4725 actual address (I2C scan found 0x60, not 0x62)
+    dac.begin(0x60);   // MCP4725 actual address: ADDR pad soldered to GND (A0=0 -> 0x60)
 
     // Auto-zero the MAP at atmosphere. Uses the timeout-bounded safeReadADS1115() instead of the
     // Adafruit blocking read, so a flaky bus can never hang setup() in an endless conversion-wait.
