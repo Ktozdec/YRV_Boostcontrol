@@ -1,9 +1,11 @@
 ﻿package com.example.booster.ble
 
 import android.util.Log
+import com.example.booster.data.AckResult
+import com.example.booster.data.SettingsUiState
 import com.example.booster.data.TelemetryData
+import com.example.booster.data.toSettingsUiState
 import com.juul.kable.AndroidPeripheral
-import com.juul.kable.Filter
 import com.juul.kable.Peripheral
 import com.juul.kable.Scanner
 import com.juul.kable.State
@@ -16,13 +18,20 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.catch
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.flow.filter
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.launchIn
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.onEach
+import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -33,7 +42,10 @@ class BleManager {
     private val rxCharacteristic = characteristicOf(serviceUuid, "6E400002-B5A3-F393-E0A9-E50E24DCCA9E")
     private val txCharacteristic = characteristicOf(serviceUuid, "6E400003-B5A3-F393-E0A9-E50E24DCCA9E")
 
-    private val scanner = Scanner { filters = listOf(Filter.Name("YRV_Boost_BLE")) }
+    // No hardware (offloaded) name filter: Android's offloaded ScanFilter.setDeviceName matches only
+    // the PRIMARY advertisement, so it silently misses a device whose name is carried in the scan
+    // response. Scan unfiltered and match the name in software (below) — robust to where it's advertised.
+    private val scanner = Scanner { }
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val writeMutex = Mutex()
 
@@ -48,6 +60,26 @@ class BleManager {
     private val _telemetry = MutableStateFlow(TelemetryData())
     val telemetry = _telemetry.asStateFlow()
 
+    // Settings ride the same TelemetryData as the 8 Hz "T" stream but change only on an "S" packet.
+    // This derived flow re-emits only when a settings field actually changes (value-based equality),
+    // so the Settings screen isn't recomposed 8×/second by the live telemetry.
+    val settings: StateFlow<SettingsUiState> = _telemetry
+        .map { it.toSettingsUiState() }
+        .distinctUntilChanged()
+        // WhileSubscribed: stop mapping the 8 Hz stream when no screen is observing settings.
+        .stateIn(scope, SharingStarted.WhileSubscribed(5000), SettingsUiState())
+
+    // Negotiated ATT MTU (23 until the exchange succeeds). One characteristic write carries at most
+    // MTU-3 bytes, so the batch "SETALL" save is only safe once a large MTU is negotiated; below that
+    // the Settings screen falls back to short per-key SET commands.
+    private val _mtu = MutableStateFlow(23)
+    val mtu = _mtu.asStateFlow()
+
+    // One-shot command acknowledgements from the ECU (the "ack" packet). A SharedFlow (events, not
+    // state) so the save flow can await the specific SAVE ack without matching a stale value.
+    private val _ackEvents = MutableSharedFlow<AckResult>(extraBufferCapacity = 16)
+    val ackEvents: SharedFlow<AckResult> = _ackEvents
+
     fun connect() {
         if (isIntendedToConnect) return
         isIntendedToConnect = true
@@ -60,6 +92,9 @@ class BleManager {
                         .filter { it.name == "YRV_Boost_BLE" }
                         .first()
 
+                    // Diagnostic: if this line never appears in logcat (tag "BLE"), the SCAN stage is
+                    // failing (permissions/неверный neverForLocation), not the connect stage.
+                    Log.i("BLE", "Найдено в скане: name=${advertisement.name}")
                     _connectionStatus.value = "Найдено, подключаемся..."
                     val newPeripheral = scope.peripheral(advertisement)
                     peripheral = newPeripheral
@@ -74,10 +109,14 @@ class BleManager {
                     }.launchIn(this)
 
                     newPeripheral.connect()
-                    delay(500)
+                    // Short settle, then ask for the big MTU right away so the settings burst that
+                    // the firmware sends on connect lands at full MTU (fewer chunks, fewer drops).
+                    delay(150)
 
+                    _mtu.value = 23
                     try {
-                        (newPeripheral as? AndroidPeripheral)?.requestMtu(247)
+                        val negotiated = (newPeripheral as? AndroidPeripheral)?.requestMtu(247)
+                        if (negotiated != null) _mtu.value = negotiated
                     } catch (e: Exception) {
                         Log.w("BLE", "MTU не расширен: ${e.message}")
                     }
@@ -129,6 +168,10 @@ class BleManager {
                                     baseDuty = json.optDouble("bD", current.baseDuty.toDouble()).toFloat(),
                                     currentDuty = json.optDouble("cD", current.currentDuty.toDouble()).toFloat(),
                                     mode = json.optInt("mode", current.mode),
+                                    autoKp = json.optDouble("kPa", current.autoKp.toDouble()).toFloat(),
+                                    autoKi = json.optDouble("kIa", current.autoKi.toDouble()).toFloat(),
+                                    autoKd = json.optDouble("kDa", current.autoKd.toDouble()).toFloat(),
+                                    autoTuneEpisodes = json.optInt("ate", current.autoTuneEpisodes),
                                     lastError = null,
                                     telemetryUpdatedAtMillis = System.currentTimeMillis()
                                 )
@@ -148,6 +191,7 @@ class BleManager {
                                     spoolBlendHigh = json.optDouble("bH", current.spoolBlendHigh.toDouble()).toFloat(),
                                     spoolBlendLow = json.optDouble("bL", current.spoolBlendLow.toDouble()).toFloat(),
                                     dutyFallSlew = json.optDouble("fS", current.dutyFallSlew.toDouble()).toFloat(),
+                                    autoTuneEnabled = json.optInt("aT", current.autoTuneEnabled),
                                     pulsesRpm = json.optDouble("pR", current.pulsesRpm.toDouble()).toFloat(),
                                     vssPulses = json.optDouble("vP", current.vssPulses.toDouble()).toFloat(),
                                     tireW = json.optInt("tW", current.tireW),
@@ -177,6 +221,7 @@ class BleManager {
                                     val ack = json.optString("ack").takeIf { it.isNotBlank() }
                                     val ok = json.optBoolean("ok", true)
                                     val error = json.optString("err").takeIf { it.isNotBlank() }
+                                    _ackEvents.tryEmit(AckResult(ack ?: "", ok, error))
                                     if (ok) {
                                         Log.d("BLE_ACK", "Подтверждено: $ack")
                                         current.copy(lastAck = ack, lastError = null)
@@ -204,23 +249,33 @@ class BleManager {
             .launchIn(scope)
     }
 
-    fun sendCommand(command: String) {
-        if (command.isBlank()) return
+    fun sendCommand(command: String) = sendCommands(listOf(command))
+
+    /**
+     * Writes [commands] in order under a single lock hold, so the dispatcher can't reorder them —
+     * e.g. "SAVE" must never run before the settings it is meant to persist. Stops the sequence on
+     * the first failed write, so a failed setting is not followed by a SAVE of a half-applied state.
+     */
+    fun sendCommands(commands: List<String>) {
+        if (commands.isEmpty()) return
 
         scope.launch {
             writeMutex.withLock {
                 val currentPeripheral = peripheral
                 if (currentPeripheral == null) {
-                    Log.w("BLE", "Команда пропущена, соединение отсутствует: $command")
+                    Log.w("BLE", "Команды пропущены, соединение отсутствует: $commands")
                     return@withLock
                 }
 
-                try {
-                    currentPeripheral.write(rxCharacteristic, command.toByteArray(), WriteType.WithResponse)
-                    Log.d("BLE", "Отправлено: $command")
-                    delay(20)
-                } catch (e: Exception) {
-                    Log.e("BLE", "Ошибка отправки команды: $command", e)
+                for (command in commands) {
+                    if (command.isBlank()) continue
+                    try {
+                        currentPeripheral.write(rxCharacteristic, command.toByteArray(), WriteType.WithResponse)
+                        Log.d("BLE", "Отправлено: $command")
+                    } catch (e: Exception) {
+                        Log.e("BLE", "Ошибка отправки команды: $command", e)
+                        break
+                    }
                 }
             }
         }

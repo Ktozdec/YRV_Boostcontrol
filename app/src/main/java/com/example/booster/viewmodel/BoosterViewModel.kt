@@ -35,6 +35,9 @@ class BoosterViewModel(application: Application) : AndroidViewModel(application)
 
     val connectionStatus = bleManager.connectionStatus
     val telemetry = bleManager.telemetry
+    val settingsState = bleManager.settings
+    val mtu = bleManager.mtu
+    val ackEvents = bleManager.ackEvents
 
     private val _tripLogSize = MutableStateFlow(0)
     val tripLogSize = _tripLogSize.asStateFlow()
@@ -87,6 +90,10 @@ class BoosterViewModel(application: Application) : AndroidViewModel(application)
 
     fun sendCommand(cmd: String) {
         bleManager.sendCommand(cmd)
+    }
+
+    fun sendCommands(cmds: List<String>) {
+        bleManager.sendCommands(cmds)
     }
 
     fun sendKLineHexCommand(hex: String) {

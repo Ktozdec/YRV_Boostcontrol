@@ -30,6 +30,12 @@ data class TelemetryData(
     @SerialName("kP") val kP: Float = 0.0f,
     @SerialName("kI") val kI: Float = 0.0f,
     @SerialName("kD") val kD: Float = 0.0f,
+    // V2 self-tuning PID: live auto-tuned gains (from the "T" packet) + master switch + episode count.
+    @SerialName("kPa") val autoKp: Float = 0.0f,
+    @SerialName("kIa") val autoKi: Float = 0.0f,
+    @SerialName("kDa") val autoKd: Float = 0.0f,
+    @SerialName("aT") val autoTuneEnabled: Int = 1,
+    @SerialName("ate") val autoTuneEpisodes: Int = 0,
     @SerialName("lA") val learnCoeff: Float = 0.0f,
     @SerialName("bH") val spoolBlendHigh: Float = 0.30f,
     @SerialName("bL") val spoolBlendLow: Float = 0.05f,
@@ -51,4 +57,59 @@ data class TelemetryData(
     val lastAck: String? = null,
     val lastError: String? = null,
     val telemetryUpdatedAtMillis: Long = 0L
+)
+
+/**
+ * The slice of [TelemetryData] the Settings screen actually edits. It only carries fields that come
+ * from the rare "S" settings packet (plus [lastError] for the ECU-error toast). Exposed as its own
+ * flow so the Settings screen recomposes when a *setting* changes — not 8×/second under the live
+ * "T" telemetry stream. Equality is value-based (data class), so a no-op re-send doesn't re-emit.
+ */
+data class SettingsUiState(
+    val targetBoost: Float = 0.0f,
+    val limitBoostBar: Float = 0.95f,
+    val softLimpBar: Float = 1.15f,
+    val hardLimpBar: Float = 1.30f,
+    val kP: Float = 0.0f,
+    val kI: Float = 0.0f,
+    val kD: Float = 0.0f,
+    val learnCoeff: Float = 0.0f,
+    val spoolBlendHigh: Float = 0.30f,
+    val spoolBlendLow: Float = 0.05f,
+    val dutyFallSlew: Float = 300.0f,
+    val offsetMap: Float = 0.0f,
+    val scaleMap: Float = 0.0f,
+    val offsetTps: Float = 0.0f,
+    val pulsesRpm: Float = 0.0f,
+    val vssPulses: Float = 0.0f,
+    val autoTuneEnabled: Int = 1,
+    val lastError: String? = null
+)
+
+fun TelemetryData.toSettingsUiState(): SettingsUiState = SettingsUiState(
+    targetBoost = targetBoost,
+    limitBoostBar = limitBoostBar,
+    softLimpBar = softLimpBar,
+    hardLimpBar = hardLimpBar,
+    kP = kP,
+    kI = kI,
+    kD = kD,
+    learnCoeff = learnCoeff,
+    spoolBlendHigh = spoolBlendHigh,
+    spoolBlendLow = spoolBlendLow,
+    dutyFallSlew = dutyFallSlew,
+    offsetMap = offsetMap,
+    scaleMap = scaleMap,
+    offsetTps = offsetTps,
+    pulsesRpm = pulsesRpm,
+    vssPulses = vssPulses,
+    autoTuneEnabled = autoTuneEnabled,
+    lastError = lastError
+)
+
+/** One ECU command acknowledgement (the "ack" packet): which command, success, optional reason. */
+data class AckResult(
+    val cmd: String,
+    val ok: Boolean,
+    val error: String?
 )

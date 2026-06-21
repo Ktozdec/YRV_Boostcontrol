@@ -38,11 +38,11 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -57,22 +57,26 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.booster.viewmodel.BoosterViewModel
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.withTimeoutOrNull
 import java.util.Locale
 
 @Composable
 fun SettingsScreen(viewModel: BoosterViewModel) {
-    val data by viewModel.telemetry.collectAsStateWithLifecycle()
+    val settings by viewModel.settingsState.collectAsStateWithLifecycle()
+    // Live telemetry stays as a State and is read (.value) only inside the cards that show live
+    // values, so the 8 Hz stream recomposes just those cards — not the whole screen or the TuneRows.
+    val liveState = viewModel.telemetry.collectAsStateWithLifecycle()
+    val protectionMode by remember { derivedStateOf { liveState.value.mode } }
     val connectionStatus by viewModel.connectionStatus.collectAsStateWithLifecycle()
     val context = LocalContext.current
-    val scope = rememberCoroutineScope()
 
     var testDutySlider by remember { mutableFloatStateOf(0f) }
     var draftTb by remember { mutableFloatStateOf(0f) }
     var draftLb by remember { mutableFloatStateOf(0f) }
-    var draftSl by remember { mutableFloatStateOf(0f) }
-    var draftHl by remember { mutableFloatStateOf(0f) }
     var draftKp by remember { mutableFloatStateOf(0f) }
     var draftKi by remember { mutableFloatStateOf(0f) }
     var draftKd by remember { mutableFloatStateOf(0f) }
@@ -89,40 +93,47 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
     var isInitialized by remember { mutableStateOf(false) }
     var showOtaDialog by remember { mutableStateOf(false) }
     var justSaved by remember { mutableStateOf(false) }
+    var saveInFlight by remember { mutableStateOf(false) }
+    var saveTrigger by remember { mutableStateOf(0) }
 
     // Keyed on isInitialized too: when the connect effect below resets it, this re-fires and
     // re-fills the drafts even if targetBoost didn't change value (fixes the stuck-init race).
-    LaunchedEffect(data.targetBoost, isInitialized) {
-        if (!isInitialized && data.targetBoost != 0f) {
-            draftTb = data.targetBoost
-            draftLb = data.limitBoostBar
-            draftSl = data.softLimpBar
-            draftHl = data.hardLimpBar
-            draftKp = data.kP
-            draftKi = data.kI
-            draftKd = data.kD
-            draftBh = data.spoolBlendHigh
-            draftBl = data.spoolBlendLow
-            draftFs = data.dutyFallSlew
-            draftOp = data.offsetMap
-            draftSp = data.scaleMap
-            draftOv = data.offsetTps
-            draftPr = data.pulsesRpm
-            draftVp = data.vssPulses
-            draftLa = data.learnCoeff
+    LaunchedEffect(settings.targetBoost, isInitialized) {
+        if (!isInitialized && settings.targetBoost != 0f) {
+            draftTb = settings.targetBoost
+            draftLb = settings.limitBoostBar
+            draftKp = settings.kP
+            draftKi = settings.kI
+            draftKd = settings.kD
+            draftBh = settings.spoolBlendHigh
+            draftBl = settings.spoolBlendLow
+            draftFs = settings.dutyFallSlew
+            draftOp = settings.offsetMap
+            draftSp = settings.scaleMap
+            draftOv = settings.offsetTps
+            draftPr = settings.pulsesRpm
+            draftVp = settings.vssPulses
+            draftLa = settings.learnCoeff
             isInitialized = true
         }
     }
 
-    LaunchedEffect(data.lastError) {
-        val error = data.lastError ?: return@LaunchedEffect
+    LaunchedEffect(settings.lastError) {
+        val error = settings.lastError ?: return@LaunchedEffect
         Toast.makeText(context, "Ошибка ЭБУ: $error", Toast.LENGTH_SHORT).show()
     }
 
     LaunchedEffect(connectionStatus) {
         if (connectionStatus == "Подключено") {
             isInitialized = false
-            viewModel.sendCommand("GET:SETTINGS")
+            // Settings ("S") come over notify (unacknowledged); the firmware bursts them on connect,
+            // but if every copy is lost the screen would stay empty. Retry until they arrive.
+            var tries = 0
+            while (viewModel.settingsState.value.targetBoost == 0f && tries < 6) {
+                viewModel.sendCommand("GET:SETTINGS")
+                delay(500)
+                tries++
+            }
         }
     }
 
@@ -133,13 +144,62 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         }
     }
 
+    // ACK-driven save: send the batch (or per-key fallback) and confirm only on the real SAVE ack
+    // from the ECU; surface a rejection (e.g. partial SETALL) or a no-response timeout instead of
+    // claiming success blindly. Subscribe to acks BEFORE sending so a fast ack isn't missed.
+    LaunchedEffect(saveTrigger) {
+        if (saveTrigger == 0) return@LaunchedEffect
+        saveInFlight = true
+        val pairs = listOf(
+            "tB" to fmt(clampValue(draftTb, 0.3f, 1.5f), "%.2f"),
+            "lB" to fmt(clampValue(draftLb, 0.3f, 2.0f), "%.2f"),
+            "kP" to fmt(clampValue(draftKp, 0f, 200f), "%.1f"),
+            "kI" to fmt(clampValue(draftKi, 0f, 200f), "%.1f"),
+            "kD" to fmt(clampValue(draftKd, 0f, 50f), "%.1f"),
+            "lA" to fmt(clampValue(draftLa, 0.02f, 0.30f), "%.2f"),
+            "bH" to fmt(clampValue(draftBh, 0.05f, 1.0f), "%.2f"),
+            "bL" to fmt(clampValue(draftBl, 0.0f, 0.5f), "%.2f"),
+            "fS" to fmt(clampValue(draftFs, 50f, 1000f), "%.0f"),
+            "oP" to fmt(clampValue(draftOp, 0.1f, 4.5f), "%.2f"),
+            "sP" to fmt(clampValue(draftSp, 0.1f, 2.0f), "%.2f"),
+            "oV" to fmt(clampValue(draftOv, 0.1f, 3.5f), "%.2f"),
+            "pR" to fmt(clampValue(draftPr, 0.5f, 8.0f), "%.1f"),
+            "vP" to fmt(clampValue(draftVp, 1.0f, 40.0f), "%.2f")
+        )
+        val commands = buildList {
+            if (viewModel.mtu.value >= 200) {
+                add("SETALL:" + pairs.joinToString(";") { "${it.first}=${it.second}" })
+            } else {
+                pairs.forEach { add("SET:${it.first}:${it.second}") }
+            }
+            add("SAVE")
+        }
+        val result = withTimeoutOrNull(2500) {
+            coroutineScope {
+                val ack = async { viewModel.ackEvents.first { it.cmd == "SAVE" || !it.ok } }
+                viewModel.sendCommands(commands)
+                ack.await()
+            }
+        }
+        saveInFlight = false
+        when {
+            result == null -> Toast.makeText(context, "Нет ответа от ЭБУ — проверьте связь", Toast.LENGTH_SHORT).show()
+            result.ok -> {
+                justSaved = true
+                Toast.makeText(context, "Настройки сохранены", Toast.LENGTH_SHORT).show()
+            }
+            else -> Toast.makeText(context, "Ошибка ЭБУ: ${result.error ?: result.cmd}", Toast.LENGTH_SHORT).show()
+        }
+    }
+
     // Button enables on whether real settings are present (targetBoost is never 0 once an "S"
     // packet arrived) — NOT on the one-shot isInitialized flag, which the connect effect resets.
-    val isSettingsLoaded = data.targetBoost != 0f
+    val isSettingsLoaded = settings.targetBoost != 0f
 
     val saveButtonColor by animateColorAsState(
         targetValue = when {
             justSaved -> StatusGreen
+            saveInFlight -> AccentAmber
             isSettingsLoaded -> BoostBlue.copy(alpha = 0.85f)
             else -> Color(0xFF232323)
         },
@@ -171,8 +231,16 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
 
         item {
             SettingsCard(title = "Защита от передува (Limp)") {
-                TuneRow("Soft limp — дьюти 20% (бар)", draftSl, 0.05f, "%.2f", 0.5f, 2.0f) { draftSl = it }
-                TuneRow("Hard limp — дьюти 0% (бар)", draftHl, 0.05f, "%.2f", 0.5f, 2.5f) { draftHl = it }
+                Text(
+                    "Пороги выводятся из целевого наддува автоматически и следуют за ним: " +
+                        "soft = target + 0.15, hard = target + 0.20 бар.",
+                    color = TextGray,
+                    fontSize = 12.sp,
+                    letterSpacing = 0.3.sp,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                ReadOnlyRow("Soft limp — дьюти 20% (бар)", fmt(draftTb + 0.15f, "%.2f"))
+                ReadOnlyRow("Hard limp — дьюти 0% (бар)", fmt(draftTb + 0.20f, "%.2f"))
             }
         }
 
@@ -207,6 +275,38 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                         Text("НОРМА", fontSize = 12.sp, fontWeight = FontWeight.Bold, color = TextGray)
                     }
                 }
+
+                // V2: self-tuning PID. The auto gains live in the firmware (kPa/kIa/kDa) and adapt per
+                // pull; here we just show them live and let the driver arm/disarm the tuner.
+                Spacer(Modifier.height(12.dp))
+                val autoOn = settings.autoTuneEnabled != 0
+                val live = liveState.value
+                Text(
+                    "Автотюн ПИД (V2): ${if (autoOn) "ВКЛ" else "ВЫКЛ"}",
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                    color = if (autoOn) BoostRed else TextGray
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    "Авто kP/kI/kD: ${fmt(live.autoKp, "%.1f")} / ${fmt(live.autoKi, "%.1f")} / " +
+                        "${fmt(live.autoKd, "%.1f")} · эпизодов: ${live.autoTuneEpisodes}",
+                    fontSize = 12.sp, color = TextGray
+                )
+                Spacer(Modifier.height(6.dp))
+                Button(
+                    onClick = { viewModel.sendCommand("SET:aT:${if (autoOn) 0 else 1}") },
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (autoOn) Color(0xFF2C2C2E) else BoostRed.copy(alpha = 0.85f)
+                    )
+                ) {
+                    Text(
+                        if (autoOn) "ВЫКЛЮЧИТЬ АВТОТЮН" else "ВКЛЮЧИТЬ АВТОТЮН",
+                        fontSize = 12.sp, fontWeight = FontWeight.Bold,
+                        color = if (autoOn) TextGray else NeonWhite
+                    )
+                }
             }
         }
 
@@ -237,10 +337,10 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
             }
         }
 
-        if (data.mode != 0) {
+        if (protectionMode != 0) {
             item {
-                val modeText = if (data.mode == 1) "SOFT LIMP" else "HARD LIMP"
-                val modeColor = if (data.mode == 1) AccentAmber else BoostRed
+                val modeText = if (protectionMode == 1) "SOFT LIMP" else "HARD LIMP"
+                val modeColor = if (protectionMode == 1) AccentAmber else BoostRed
                 SettingsCard(title = "Статус защиты") {
                     Text(
                         "ЭБУ сейчас в режиме $modeText. На время настройки проверь датчики, калибровки и фактический буст.",
@@ -255,54 +355,23 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
         item {
             Button(
                 onClick = {
+                    if (saveInFlight) return@Button
                     if (!isSettingsLoaded) {
                         Toast.makeText(context, "Дождитесь загрузки основных настроек из ЭБУ", Toast.LENGTH_SHORT).show()
                         return@Button
                     }
-                    scope.launch {
-                        viewModel.sendCommand("SET:tB:${fmt(clampValue(draftTb, 0.3f, 1.5f), "%.2f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:lB:${fmt(clampValue(draftLb, 0.3f, 2.0f), "%.2f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:sL:${fmt(clampValue(draftSl, 0.5f, 2.0f), "%.2f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:hL:${fmt(clampValue(draftHl, 0.5f, 2.5f), "%.2f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:kP:${fmt(clampValue(draftKp, 0f, 200f), "%.1f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:kI:${fmt(clampValue(draftKi, 0f, 200f), "%.1f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:kD:${fmt(clampValue(draftKd, 0f, 50f), "%.1f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:lA:${fmt(clampValue(draftLa, 0.02f, 0.30f), "%.2f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:bH:${fmt(clampValue(draftBh, 0.05f, 1.0f), "%.2f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:bL:${fmt(clampValue(draftBl, 0.0f, 0.5f), "%.2f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:fS:${fmt(clampValue(draftFs, 50f, 1000f), "%.0f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:oP:${fmt(clampValue(draftOp, 0.1f, 4.5f), "%.2f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:sP:${fmt(clampValue(draftSp, 0.1f, 2.0f), "%.2f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:oV:${fmt(clampValue(draftOv, 0.1f, 3.5f), "%.2f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:pR:${fmt(clampValue(draftPr, 0.5f, 8.0f), "%.1f")}")
-                        delay(30)
-                        viewModel.sendCommand("SET:vP:${fmt(clampValue(draftVp, 1.0f, 40.0f), "%.2f")}")
-                        delay(30)
-                        viewModel.sendCommand("SAVE")
-                        Toast.makeText(context, "Настройки сохранены", Toast.LENGTH_SHORT).show()
-                        justSaved = true
-                    }
+                    saveTrigger++   // actual send + ACK handling lives in LaunchedEffect(saveTrigger)
                 },
                 modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp).height(60.dp),
                 shape = RoundedCornerShape(14.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = saveButtonColor)
             ) {
                 Text(
-                    if (justSaved) "СОХРАНЕНО" else "СОХРАНИТЬ",
+                    when {
+                        justSaved -> "СОХРАНЕНО"
+                        saveInFlight -> "СОХРАНЕНИЕ…"
+                        else -> "СОХРАНИТЬ"
+                    },
                     style = MaterialTheme.typography.titleMedium,
                     fontWeight = FontWeight.Bold,
                     letterSpacing = 1.sp,
@@ -313,6 +382,7 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
 
         item {
             SettingsCard(title = "Сервисные функции") {
+                val live = liveState.value
                 Text(
                     "ТЕСТ СОЛЕНОИДА: ${testDutySlider.toInt()}%",
                     fontWeight = FontWeight.Bold,
@@ -324,11 +394,11 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                     onValueChange = { testDutySlider = it.coerceIn(0f, 100f) },
                     onValueChangeFinished = { viewModel.sendCommand("DUTY:${testDutySlider.toInt()}") },
                     valueRange = 0f..100f,
-                    enabled = data.speed < 2
+                    enabled = live.speed < 2
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "База: ${data.baseDuty}%  |  Выход: ${data.currentDuty}%",
+                    "База: ${live.baseDuty}%  |  Выход: ${live.currentDuty}%",
                     color = TextGray,
                     fontSize = 12.sp,
                     fontFamily = FontFamily.Monospace
@@ -492,3 +562,22 @@ fun TuneRow(
 private fun clampValue(value: Float, min: Float, max: Float): Float = value.coerceIn(min, max)
 
 private fun fmt(value: Float, pattern: String): String = String.format(Locale.US, pattern, value)
+
+// Read-only value row (label left, value right) for settings the ECU derives and the user can't edit.
+@Composable
+fun ReadOnlyRow(label: String, value: String) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(vertical = 5.dp),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(label, modifier = Modifier.weight(1f), fontSize = 14.sp, color = NeonWhite)
+        Text(
+            value,
+            color = TextGray,
+            fontSize = 14.sp,
+            fontWeight = FontWeight.SemiBold,
+            fontFamily = FontFamily.Monospace
+        )
+    }
+}

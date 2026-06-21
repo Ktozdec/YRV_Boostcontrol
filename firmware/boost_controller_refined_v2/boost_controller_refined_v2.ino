@@ -5,20 +5,21 @@
 #include <Adafruit_ADS1X15.h>
 #include <Wire.h>
 #include <Preferences.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
-#include <BLE2902.h>
+#include <NimBLEDevice.h>
 #include <Adafruit_MCP4725.h>
-#include "esp_gap_ble_api.h"
 #include "driver/pcnt.h"
 #include "esp_task_wdt.h"
 #include "esp_system.h"
 
 #define WATCHDOG_TIMEOUT_SEC 5
-#define BLE_MAX_MESSAGE_LEN 180
+#define BLE_MAX_MESSAGE_LEN 256   // must fit the batch "SETALL:k=v;..." write (~130 chars) with headroom
 #define BLE_NOTIFY_INTERVAL_MS 125
-#define SETTINGS_RESEND_INTERVAL_MS 60
+// "S" settings packet is sent as a short burst — one copy per telemetry cycle (~125 ms apart) —
+// instead of a single notify. A lost/truncated "S" right after connect then self-heals on the next
+// cycle, so the app no longer needs the user to re-enter the Settings screen to re-request it.
+#define SETTINGS_SEND_BURST 3
+// Verbose 5-second serial diagnostics block in TaskTelemetry. Set to 0 for a release build.
+#define DEBUG_DIAG 1
 #define KLINE_BAUD 10400
 #define KLINE_FRAME_GAP_MS 25
 #define KLINE_MAX_FRAME_LEN 48
@@ -122,6 +123,39 @@ constexpr float GAIN_RPM_MID  = 4000.0f;   // multiplier = 1.0 here
 constexpr float GAIN_RPM_HIGH = 6000.0f;
 // ===============================================================================
 
+// ============================ V2: SELF-TUNING PID ==============================
+// The feed-forward map already absorbs the steady-state bias (learnDutyMap3D), so the PID
+// only shapes the TRANSIENT. This tuner watches each tip-in "episode", scores it (overshoot,
+// rise time, hunting, overboost) and nudges kPa/kIa/kDa by one small bounded step per episode —
+// the same converge-over-many-pulls philosophy as the map. The auto gains live in their OWN
+// NVS keys (kPa/kIa/kDa), seeded once from the manual V1 gains, so flashing V1 back is safe.
+constexpr bool  AUTOTUNE_ENABLED_DEF = true;   // master switch (runtime key "aT")
+// -- Hard envelope: the tuner can never leave this box (safety) --
+constexpr float KP_MIN = 8.0f,  KP_MAX = 40.0f;
+constexpr float KI_MIN = 4.0f,  KI_MAX = 28.0f;
+constexpr float KD_MIN = 2.0f,  KD_MAX = 20.0f;
+// -- Per-episode multiplicative step (so the step scales with the current gain) --
+constexpr float AT_STEP_KP = 0.04f;   // +/- 4 %
+constexpr float AT_STEP_KI = 0.03f;
+constexpr float AT_STEP_KD = 0.05f;
+constexpr float AT_EWMA    = 0.30f;   // episode-to-episode metric smoothing
+// -- Symptom thresholds --
+constexpr float AT_OVERSHOOT_HI = 0.06f;   // bar past target = "too hot"
+constexpr float AT_OVERSHOOT_LO = 0.02f;   // essentially no overshoot
+constexpr float AT_RISE_HI_MS   = 900.0f;  // time-to-band above this = "sluggish"
+constexpr float AT_OSC_MAX      = 3.0f;     // error sign-changes after target = hunting
+constexpr float AT_OFFSET_HI    = 0.04f;    // residual |err| at episode end = needs more kI
+constexpr float AT_SETTLE_BAND  = 0.03f;
+constexpr uint32_t AT_SETTLE_HOLD_MS    = 400;
+constexpr uint32_t AT_EPISODE_TIMEOUT_MS = 6000;
+// -- Panic de-tune on overboost (asymmetric: back off fast, push up slow) --
+constexpr float AT_PANIC_KP = 0.12f;   // -12 % immediately
+constexpr float AT_PANIC_KI = 0.15f;
+// -- Persistence --
+constexpr uint32_t AT_SAVE_INTERVAL_MS         = 60000;
+constexpr uint16_t AT_MIN_EPISODES_BEFORE_SAVE = 3;
+// ===============================================================================
+
 const float ATMOS_MIN_VOLTS    = 2.40f;
 const float ATMOS_MAX_VOLTS    = 2.70f;
 const float DEFAULT_OFFSET     = 2.57f;
@@ -164,12 +198,42 @@ struct PID_Config {
     float kP = DEFAULT_KP;
     float kI = DEFAULT_KI;
     float kD = DEFAULT_KD;
+    // V2: auto-tuned gains (own NVS keys kPa/kIa/kDa). The control loop runs on THESE; the manual
+    // kP/kI/kD above are kept only as the V1-compatible seed and are never written by the tuner.
+    float kPa = DEFAULT_KP;
+    float kIa = DEFAULT_KI;
+    float kDa = DEFAULT_KD;
     float learnCoeff = DEFAULT_LEARN_RATE;   // integral-offload rate (see ADAPTIVE TUNING above)
     float integral = 0.0f;
     float lastError = 0.0f;
     float lastMeas = 0.0f;      // last boost reading, for derivative-on-measurement (no setpoint kick)
     float filteredDerivative = 0.0f;
 } pid;
+
+// V2: self-tuning state (persisted) and the live transient-capture episode (runtime only).
+struct AutoTuneState {
+    bool   enabled = AUTOTUNE_ENABLED_DEF;
+    float  lkgKp = DEFAULT_KP, lkgKi = DEFAULT_KI, lkgKd = DEFAULT_KD;   // last-known-good for divergence rollback
+    float  emaOvershoot = 0.0f, emaRise = 0.0f, emaOsc = 0.0f;          // smoothed metrics
+    float  prevOvershoot = 0.0f;
+    uint8_t divergeStreak = 0;
+    uint16_t episodes = 0;
+    uint32_t lastSaveMs = 0;
+    bool   dirty = false;
+} at;
+
+struct Episode {
+    bool   active = false;
+    uint32_t startMs = 0;
+    bool   reachedTarget = false;
+    float  peakBoost = 0.0f;     // for overshoot = peak - target
+    uint32_t riseMs = 0;         // time from start to first entering the target band
+    int8_t lastErrSign = 0;
+    uint16_t signChanges = 0;    // hunting counter (error sign flips after reaching target)
+    float  lateErr = 0.0f;       // EWMA of |err| once near target (residual offset for kI)
+    bool   sawLimp = false;
+    uint32_t settleStartMs = 0;
+} ep;
 
 struct RuntimeConfig {
     float offsetPIM = 2.56f;
@@ -208,7 +272,7 @@ float currentOutDuty = 0.0f;
 unsigned long lastMapSaveMs = 0;
 volatile bool mapNeedsSaving = false;
 volatile bool settingsNeedsSaving = false;
-volatile bool sendSettingsRequested = false;
+volatile int settingsSendPending = 0;   // >0 = remaining "S" burst packets, one sent per telemetry cycle
 volatile bool odometerNeedsSaving = false;
 volatile bool otaModeEnabled = false;
 volatile bool forceMapSaveRequested = false;
@@ -264,8 +328,8 @@ volatile unsigned long rpmPeriodUs = 0;
 volatile unsigned long lastRpmMicros = 0;
 volatile uint32_t g_rpmEdges = 0;   // diagnostic: total accepted tach edges
 
-BLEServer *pServer = nullptr;
-BLECharacteristic *pTxCharacteristic = nullptr;
+NimBLEServer *pServer = nullptr;
+NimBLECharacteristic *pTxCharacteristic = nullptr;
 volatile bool deviceConnected = false;
 volatile uint16_t bleConnId = 0;   // current connection id, for per-link MTU lookup
 volatile int g_adcFailStreak = 0;  // consecutive ADS1115 read failures (0 = bus healthy)
@@ -779,6 +843,68 @@ void learnDutyMap3D(float currentRpm, float currentTps, float dutyDelta, float r
     xSemaphoreGive(mapMutex);
 }
 
+// V2: scores one finished tip-in episode and applies ONE bounded gain step. Only ever called from
+// TaskControl (single task → no locking needed on `ep`/`at`/`pid`). At most one dominant symptom is
+// corrected per episode so kP/kI/kD don't fight each other in gain-space.
+void autoTunePID(float target, float hardLimpBar) {
+    float overshoot = ep.peakBoost - target;
+    if (overshoot < 0.0f) overshoot = 0.0f;
+    float rise = static_cast<float>(ep.riseMs);
+    float osc = static_cast<float>(ep.signChanges);
+    bool overboost = ep.sawLimp || ep.peakBoost >= hardLimpBar;
+
+    // Smooth the metrics so a single noisy pull can't yank the gains.
+    at.emaOvershoot = (1.0f - AT_EWMA) * at.emaOvershoot + AT_EWMA * overshoot;
+    at.emaRise      = (1.0f - AT_EWMA) * at.emaRise + AT_EWMA * rise;
+    at.emaOsc       = (1.0f - AT_EWMA) * at.emaOsc + AT_EWMA * osc;
+
+    // Divergence watchdog: overshoot growing episode-over-episode → roll back to last-known-good.
+    if (overshoot > at.prevOvershoot + 0.005f && overshoot > AT_OVERSHOOT_HI) {
+        if (at.divergeStreak < 255) at.divergeStreak++;
+    } else {
+        at.divergeStreak = 0;
+    }
+    at.prevOvershoot = overshoot;
+
+    if (at.divergeStreak >= 3) {
+        pid.kPa = at.lkgKp; pid.kIa = at.lkgKi; pid.kDa = at.lkgKd;
+        at.emaOvershoot = at.emaRise = at.emaOsc = 0.0f;
+        at.divergeStreak = 0;
+    } else if (overboost) {
+        pid.kPa *= (1.0f - AT_PANIC_KP);
+        pid.kIa *= (1.0f - AT_PANIC_KI);
+    } else if (at.emaOsc > AT_OSC_MAX) {
+        pid.kPa *= (1.0f - AT_STEP_KP);
+        pid.kIa *= (1.0f - AT_STEP_KI);
+    } else if (at.emaOvershoot > AT_OVERSHOOT_HI) {
+        pid.kPa *= (1.0f - AT_STEP_KP);
+        pid.kDa *= (1.0f + AT_STEP_KD);
+    } else if (at.emaRise > AT_RISE_HI_MS && at.emaOvershoot < AT_OVERSHOOT_LO) {
+        pid.kPa *= (1.0f + AT_STEP_KP);
+    } else if (ep.lateErr > AT_OFFSET_HI) {
+        pid.kIa *= (1.0f + AT_STEP_KI);
+    } else {
+        // Clean episode → snapshot the current gains as the rollback target.
+        at.lkgKp = pid.kPa; at.lkgKi = pid.kIa; at.lkgKd = pid.kDa;
+    }
+
+    pid.kPa = constrainFloat(pid.kPa, KP_MIN, KP_MAX);
+    pid.kIa = constrainFloat(pid.kIa, KI_MIN, KI_MAX);
+    pid.kDa = constrainFloat(pid.kDa, KD_MIN, KD_MAX);
+
+    at.episodes++;
+    at.dirty = true;
+
+    uint32_t nowMs = millis();
+    if (at.episodes >= AT_MIN_EPISODES_BEFORE_SAVE && nowMs - at.lastSaveMs >= AT_SAVE_INTERVAL_MS) {
+        settingsNeedsSaving = true;   // flushed by TaskOdometerAndStorage (throttled)
+        at.lastSaveMs = nowMs;
+    }
+
+    Serial.printf("AT ep#%u ovs:%.3f rise:%.0f osc:%.0f -> kP:%.1f kI:%.1f kD:%.1f%s\n",
+        at.episodes, overshoot, rise, osc, pid.kPa, pid.kIa, pid.kDa, overboost ? " PANIC" : "");
+}
+
 bool updateSettingValue(const String &key, const String &rawValue, String &error) {
     if (!takeMutex(configMutex, pdMS_TO_TICKS(80))) {
         error = "cfg_busy";
@@ -809,13 +935,15 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
         }
     } else if (key == "kP") {
         ok = parseFloatStrict(rawValue, 0.0f, 200.0f, fValue);
-        if (ok) pid.kP = fValue;
+        // V2: a manual edit re-seeds the auto gain ("tune from here") so the slider stays meaningful;
+        // the self-tuner then refines kPa from this point. Kept inside the envelope.
+        if (ok) { pid.kP = fValue; pid.kPa = constrainFloat(fValue, KP_MIN, KP_MAX); at.lkgKp = pid.kPa; }
     } else if (key == "kI") {
         ok = parseFloatStrict(rawValue, 0.0f, 200.0f, fValue);
-        if (ok) pid.kI = fValue;
+        if (ok) { pid.kI = fValue; pid.kIa = constrainFloat(fValue, KI_MIN, KI_MAX); at.lkgKi = pid.kIa; }
     } else if (key == "kD") {
         ok = parseFloatStrict(rawValue, 0.0f, 50.0f, fValue);
-        if (ok) pid.kD = fValue;
+        if (ok) { pid.kD = fValue; pid.kDa = constrainFloat(fValue, KD_MIN, KD_MAX); at.lkgKd = pid.kDa; }
     } else if (key == "lA") {
         ok = parseFloatStrict(rawValue, LEARN_RATE_MIN, LEARN_RATE_MAX, fValue);
         if (ok) pid.learnCoeff = fValue;
@@ -870,6 +998,10 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
     } else if (key == "fS") {
         ok = parseFloatStrict(rawValue, 50.0f, 1000.0f, fValue);
         if (ok) cfg.dutyFallSlewPerS = fValue;
+    } else if (key == "aT") {
+        // V2: enable/disable the self-tuning PID at runtime.
+        ok = parseIntStrict(rawValue, 0, 1, iValue);
+        if (ok) at.enabled = (iValue != 0);
     } else {
         ok = false;
         error = "unknown_key";
@@ -882,114 +1014,172 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
     return ok;
 }
 
-class MyServerCallbacks : public BLEServerCallbacks {
-    void onConnect(BLEServer *server, esp_ble_gatts_cb_param_t *param) override {
-        (void)server;
+class MyServerCallbacks : public NimBLEServerCallbacks {
+    // NimBLE-Arduino 2.x signatures. On 1.4.x they are:
+    //   onConnect(NimBLEServer*, ble_gap_conn_desc*) / onDisconnect(NimBLEServer*, ble_gap_conn_desc*)
+    // and the handle is desc->conn_handle instead of connInfo.getConnHandle().
+    void onConnect(NimBLEServer *server, NimBLEConnInfo &connInfo) override {
         deviceConnected = true;
-        bleConnId = param->connect.conn_id;
-        sendSettingsRequested = true;
-        // Request fast connection interval immediately after pairing:
+        bleConnId = connInfo.getConnHandle();
+        settingsSendPending = SETTINGS_SEND_BURST;
+        // Request fast connection interval right after connecting:
         // min=12*1.25ms=15ms, max=24*1.25ms=30ms, latency=0, timeout=400*10ms=4s
-        esp_ble_conn_update_params_t connParams = {};
-        memcpy(connParams.bda, param->connect.remote_bda, sizeof(esp_bd_addr_t));
-        connParams.min_int = 12;
-        connParams.max_int = 24;
-        connParams.latency = 0;
-        connParams.timeout = 400;
-        esp_ble_gap_update_conn_params(&connParams);
+        server->updateConnParams(connInfo.getConnHandle(), 12, 24, 0, 400);
     }
 
-    void onDisconnect(BLEServer *server) override {
+    void onDisconnect(NimBLEServer *server, NimBLEConnInfo &connInfo, int reason) override {
+        (void)server;
+        (void)connInfo;
+        (void)reason;
         deviceConnected = false;
-        sendSettingsRequested = false;
-        server->startAdvertising();
+        settingsSendPending = 0;
+        NimBLEDevice::startAdvertising();
     }
 };
 
-class MyCallbacks : public BLECharacteristicCallbacks {
-    void onWrite(BLECharacteristic *pCharacteristic) override {
-        String raw = pCharacteristic->getValue();
-        if (raw.length() == 0) return;
-        if (raw.length() > BLE_MAX_MESSAGE_LEN) {
-            sendBleError("BLE", "msg_too_long");
-            return;
+// Command handling runs OFF the BLE callback. onWrite() only copies the bytes into a queue and
+// returns immediately, so the BLE host task never blocks on configMutex or flash. TaskBleCommands
+// drains the queue and does the real work (parse, validate, apply, ACK).
+struct BleCommand {
+    char data[BLE_MAX_MESSAGE_LEN + 1];
+};
+QueueHandle_t bleCmdQueue = nullptr;
+
+void enqueueBleCommand(const String &raw) {
+    if (bleCmdQueue == nullptr || raw.length() == 0) return;
+    // Too long to fit the fixed buffer — drop it (the app never sends anything near this big).
+    if (raw.length() > BLE_MAX_MESSAGE_LEN) return;
+    BleCommand cmd;
+    size_t n = raw.length();
+    memcpy(cmd.data, raw.c_str(), n);
+    cmd.data[n] = '\0';
+    // Non-blocking: if the queue is somehow full we drop rather than stall the BLE host task.
+    xQueueSend(bleCmdQueue, &cmd, 0);
+}
+
+void processBleCommand(const String &msg) {
+    if (msg == "GET:SETTINGS") {
+        settingsSendPending = SETTINGS_SEND_BURST;
+        sendBleAck("GET:SETTINGS");
+        return;
+    }
+
+    if (msg.startsWith("DUTY:")) {
+        int duty = 0;
+        if (parseIntStrict(msg.substring(5), 0, 100, duty)) {
+            testDuty = duty;
+            sendBleAck("DUTY");
+        } else {
+            sendBleError("DUTY", "bad_duty");
         }
+        return;
+    }
 
-        String msg(raw);
-        msg.trim();
-        if (msg.length() == 0) return;
-
-        if (msg == "GET:SETTINGS") {
-            sendSettingsRequested = true;
-            sendBleAck("GET:SETTINGS");
-            return;
+    if (msg == "RESET") {
+        if (takeMutex(dataMutex, pdMS_TO_TICKS(40))) {
+            sensors.maxBoost = 0.0f;
+            sensors.minBoost = 1.0f;
+            sensors.maxRPM = 0.0f;
+            sensors.maxSpeed = 0.0f;
+            xSemaphoreGive(dataMutex);
         }
+        sendBleAck("RESET");
+        return;
+    }
 
-        if (msg.startsWith("DUTY:")) {
-            int duty = 0;
-            if (parseIntStrict(msg.substring(5), 0, 100, duty)) {
-                testDuty = duty;
-                sendBleAck("DUTY");
-            } else {
-                sendBleError("DUTY", "bad_duty");
+    if (msg.startsWith("KREQ:")) {
+        sendKLineRequest(msg.substring(5));
+        return;
+    }
+
+    if (msg == "SAVE") {
+        settingsNeedsSaving = true;
+        odometerNeedsSaving = true;
+        forceSettingsSaveRequested = true;
+        forceOdometerSaveRequested = true;
+        notifyStorageTask();
+        settingsSendPending = SETTINGS_SEND_BURST;   // re-push confirmed settings so the app re-syncs after save
+        sendBleAck("SAVE");
+        return;
+    }
+
+    if (msg == "OTA:ON") {
+        requestReboot(REBOOT_TO_OTA);
+        sendBleAck("OTA");
+        return;
+    }
+
+    // Batch settings write: "SETALL:k1=v1;k2=v2;...". One BLE round-trip instead of ~16 separate
+    // SET commands; each pair goes through the same validated path as a single SET.
+    if (msg.startsWith("SETALL:")) {
+        String body = msg.substring(7);
+        int failed = 0;
+        int start = 0;
+        while (start < (int)body.length()) {
+            int semi = body.indexOf(';', start);
+            String pair = (semi < 0) ? body.substring(start) : body.substring(start, semi);
+            pair.trim();
+            if (pair.length() > 0) {
+                int eq = pair.indexOf('=');
+                if (eq > 0) {
+                    String key = pair.substring(0, eq);
+                    String val = pair.substring(eq + 1);
+                    String err;
+                    if (!updateSettingValue(key, val, err)) failed++;
+                } else {
+                    failed++;
+                }
             }
+            if (semi < 0) break;
+            start = semi + 1;
+        }
+        if (failed == 0) sendBleAck("SETALL");
+        else sendBleError("SETALL", "partial");
+        return;
+    }
+
+    if (msg.startsWith("SET:")) {
+        String data = msg.substring(4);
+        int sepIndex = data.indexOf(':');
+        if (sepIndex <= 0) {
+            sendBleError("SET", "bad_format");
             return;
         }
 
-        if (msg == "RESET") {
-            if (takeMutex(dataMutex, pdMS_TO_TICKS(40))) {
-                sensors.maxBoost = 0.0f;
-                sensors.minBoost = 1.0f;
-                sensors.maxRPM = 0.0f;
-                sensors.maxSpeed = 0.0f;
-                xSemaphoreGive(dataMutex);
-            }
-            sendBleAck("RESET");
-            return;
+        String key = data.substring(0, sepIndex);
+        String val = data.substring(sepIndex + 1);
+
+        String error;
+        if (updateSettingValue(key, val, error)) {
+            sendBleAck(key.c_str());
+        } else {
+            sendBleError(key.c_str(), error.c_str());
         }
+        return;
+    }
 
-        if (msg.startsWith("KREQ:")) {
-            sendKLineRequest(msg.substring(5));
-            return;
+    sendBleError("BLE", "unknown_cmd");
+}
+
+void TaskBleCommands(void *pvParameters) {
+    (void)pvParameters;
+    esp_task_wdt_add(nullptr);
+    BleCommand cmd;
+    for (;;) {
+        if (xQueueReceive(bleCmdQueue, &cmd, pdMS_TO_TICKS(500)) == pdTRUE) {
+            String msg(cmd.data);
+            msg.trim();
+            if (msg.length() > 0) processBleCommand(msg);
         }
+        esp_task_wdt_reset();
+    }
+}
 
-        if (msg == "SAVE") {
-            settingsNeedsSaving = true;
-            odometerNeedsSaving = true;
-            forceSettingsSaveRequested = true;
-            forceOdometerSaveRequested = true;
-            notifyStorageTask();
-            sendBleAck("SAVE");
-            return;
-        }
-
-        if (msg == "OTA:ON") {
-            requestReboot(REBOOT_TO_OTA);
-            sendBleAck("OTA");
-            return;
-        }
-
-        if (msg.startsWith("SET:")) {
-            String data = msg.substring(4);
-            int sepIndex = data.indexOf(':');
-            if (sepIndex <= 0) {
-                sendBleError("SET", "bad_format");
-                return;
-            }
-
-            String key = data.substring(0, sepIndex);
-            String val = data.substring(sepIndex + 1);
-
-            String error;
-            if (updateSettingValue(key, val, error)) {
-                sendBleAck(key.c_str());
-            } else {
-                sendBleError(key.c_str(), error.c_str());
-            }
-            return;
-        }
-
-        sendBleError("BLE", "unknown_cmd");
+class MyCallbacks : public NimBLECharacteristicCallbacks {
+    // NimBLE 2.x passes NimBLEConnInfo; on 1.4.x it is just onWrite(NimBLECharacteristic*).
+    void onWrite(NimBLECharacteristic *pCharacteristic, NimBLEConnInfo &connInfo) override {
+        (void)connInfo;
+        enqueueBleCommand(String(pCharacteristic->getValue().c_str()));
     }
 };
 
@@ -1327,9 +1517,9 @@ void TaskControl(void *pvParameters) {
 
             // Gain scheduling: aggressive on spool, gentle up top.
             float gainFactor = spoolGainFactor(d.rpm);
-            float kpEff = pid.kP * gainFactor;
-            float kiEff = pid.kI * (1.0f + (gainFactor - 1.0f) * 0.5f);
-            float kdEff = pid.kD;
+            float kpEff = pid.kPa * gainFactor;                              // V2: auto-tuned base gains
+            float kiEff = pid.kIa * (1.0f + (gainFactor - 1.0f) * 0.5f);
+            float kdEff = pid.kDa;
 
             // F1: derivative-on-measurement evaluated over the REAL time since the boost reading
             // actually changed (the control loop runs faster than the sensor, so most cycles see
@@ -1414,7 +1604,58 @@ void TaskControl(void *pvParameters) {
                 learnDutyMap3D(d.rpm, d.tps, offload, err);
                 pid.integral -= offload * INTEGRAL_TRANSFER;
             }
+
+            // ---- V2 self-tuning PID: capture this tip-in as a "tuning episode" ----
+            // Purely observational — reads err/boost/mode already computed above, never alters the
+            // duty path. A valid episode ends on settle or timeout and feeds autoTunePID().
+            if (at.enabled) {
+                uint32_t atNowMs = millis();
+                if (!ep.active) {
+                    bool genuineTipIn = spoolArmed && spoolDeficit > localCfg.spoolBlendHigh &&
+                                        d.tps > LEARN_MIN_TPS && d.rpm > LEARN_MIN_RPM && d.speed > LEARN_MIN_SPEED;
+                    if (genuineTipIn) {
+                        ep = Episode{};
+                        ep.active = true;
+                        ep.startMs = atNowMs;
+                        ep.peakBoost = d.boost;
+                    }
+                } else {
+                    if (d.boost > ep.peakBoost) ep.peakBoost = d.boost;
+                    if (systemMode != NORMAL) ep.sawLimp = true;
+                    if (!ep.reachedTarget && err < AT_SETTLE_BAND) {
+                        ep.reachedTarget = true;
+                        ep.riseMs = atNowMs - ep.startMs;
+                        ep.lastErrSign = (err >= 0.0f) ? 1 : -1;
+                    }
+                    if (ep.reachedTarget) {
+                        ep.lateErr = ep.lateErr * 0.8f + fabs(err) * 0.2f;
+                        if (fabs(err) > 0.015f) {   // noise gate on the hunting counter
+                            int8_t s = (err >= 0.0f) ? 1 : -1;
+                            if (s != ep.lastErrSign) { ep.signChanges++; ep.lastErrSign = s; }
+                        }
+                        if (fabs(err) < AT_SETTLE_BAND) {
+                            if (ep.settleStartMs == 0) ep.settleStartMs = atNowMs;
+                        } else {
+                            ep.settleStartMs = 0;
+                        }
+                        bool settleDone = ep.settleStartMs != 0 && (atNowMs - ep.settleStartMs >= AT_SETTLE_HOLD_MS);
+                        bool timeoutDone = (atNowMs - ep.startMs >= AT_EPISODE_TIMEOUT_MS);
+                        if (settleDone || timeoutDone) {
+                            autoTunePID(dynamicTarget, localCfg.hardLimpBar);
+                            ep.active = false;
+                        }
+                    } else if (atNowMs - ep.startMs >= AT_EPISODE_TIMEOUT_MS) {
+                        ep.active = false;   // never reached target → discard (interrupted pull)
+                    }
+                }
+            }
         } else {
+            // V2: pedal lift / hard limp while an episode was open — finalize if it reached target
+            // (peakBoost already captured any overboost), otherwise discard.
+            if (ep.active) {
+                if (at.enabled && ep.reachedTarget) autoTunePID(dynamicTarget, localCfg.hardLimpBar);
+                ep.active = false;
+            }
             learningState.stableSinceMs = millis();
             pid.integral *= 0.90f;
             pid.lastError = 0.0f;
@@ -1487,6 +1728,8 @@ void TaskTelemetry(void *pvParameters) {
         }
 
         if (millis() - lastPrint > 5000) {
+            lastPrint = millis();
+#if DEBUG_DIAG
             KLineState kline = snapshotKLine();
             Serial.printf("Diag Heap:%u MaxBlock:%u TelStack:%u Mode:%d MTU:%u Conn:%d\n",
                 ESP.getFreeHeap(),
@@ -1516,33 +1759,32 @@ void TaskTelemetry(void *pvParameters) {
                 static_cast<unsigned long>(kline.frameCount),
                 kline.lastFrameLen,
                 static_cast<unsigned long>(kline.overflowCount));
-            lastPrint = millis();
+#endif
         }
 
         if (deviceConnected && millis() - lastNotifyMs >= BLE_NOTIFY_INTERVAL_MS) {
-            if (sendSettingsRequested) {
+            if (settingsSendPending > 0) {
                 RuntimeConfig localCfg = snapshotConfig();
 
                 snprintf(bleBuffer, sizeof(bleBuffer),
-                    "{\"S\":1,\"pR\":%.1f,\"oP\":%.2f,\"sP\":%.2f,\"oV\":%.2f,\"tB\":%.2f,\"lB\":%.2f,\"sL\":%.2f,\"hL\":%.2f,\"kP\":%.1f,\"kI\":%.1f,\"kD\":%.1f,\"tW\":%d,\"tA\":%d,\"tR\":%d,\"eH\":%.2f,\"vP\":%.2f,\"lA\":%.3f,\"bH\":%.2f,\"bL\":%.2f,\"fS\":%.0f}\n",
+                    "{\"S\":1,\"pR\":%.1f,\"oP\":%.2f,\"sP\":%.2f,\"oV\":%.2f,\"tB\":%.2f,\"lB\":%.2f,\"sL\":%.2f,\"hL\":%.2f,\"kP\":%.1f,\"kI\":%.1f,\"kD\":%.1f,\"tW\":%d,\"tA\":%d,\"tR\":%d,\"eH\":%.2f,\"vP\":%.2f,\"lA\":%.3f,\"bH\":%.2f,\"bL\":%.2f,\"fS\":%.0f,\"aT\":%d}\n",
                     localCfg.pulsesPerRev, localCfg.offsetPIM, localCfg.scalePIM, localCfg.offsetVTA,
                     localCfg.targetBoost, localCfg.limitBoostBar, localCfg.softLimpBar, localCfg.hardLimpBar,
                     pid.kP, pid.kI, pid.kD,
                     localCfg.tireW, localCfg.tireA, localCfg.tireR,
                     stationaryEngineHours, localCfg.vssPulsesPerRev, pid.learnCoeff,
-                    localCfg.spoolBlendHigh, localCfg.spoolBlendLow, localCfg.dutyFallSlewPerS
+                    localCfg.spoolBlendHigh, localCfg.spoolBlendLow, localCfg.dutyFallSlewPerS,
+                    at.enabled ? 1 : 0
                 );
                 sendBleText(bleBuffer);
-                vTaskDelay(pdMS_TO_TICKS(SETTINGS_RESEND_INTERVAL_MS));
-
-                sendSettingsRequested = false;
-                vTaskDelay(pdMS_TO_TICKS(SETTINGS_RESEND_INTERVAL_MS));
+                settingsSendPending--;   // one packet per cycle: burst is spread across telemetry cycles, no stall
             }
 
             snprintf(bleBuffer, sizeof(bleBuffer),
-                "{\"T\":1,\"b\":%.2f,\"miB\":%.2f,\"maB\":%.2f,\"r\":%.0f,\"maR\":%.0f,\"s\":%.0f,\"maS\":%.0f,\"v\":%.0f,\"oD\":%.2f,\"bD\":%.1f,\"cD\":%.1f,\"mode\":%d}\n",
+                "{\"T\":1,\"b\":%.2f,\"miB\":%.2f,\"maB\":%.2f,\"r\":%.0f,\"maR\":%.0f,\"s\":%.0f,\"maS\":%.0f,\"v\":%.0f,\"oD\":%.2f,\"bD\":%.1f,\"cD\":%.1f,\"mode\":%d,\"kPa\":%.1f,\"kIa\":%.1f,\"kDa\":%.1f,\"ate\":%u}\n",
                 d.boost, d.minBoost, d.maxBoost, d.rpm, d.maxRPM,
-                d.speed, d.maxSpeed, d.tps, totalDistanceKm, currentBaseDuty, currentOutDuty, static_cast<int>(systemMode)
+                d.speed, d.maxSpeed, d.tps, totalDistanceKm, currentBaseDuty, currentOutDuty, static_cast<int>(systemMode),
+                pid.kPa, pid.kIa, pid.kDa, at.episodes
             );
             sendBleText(bleBuffer);
             lastNotifyMs = millis();
@@ -1610,29 +1852,46 @@ void TaskOdometerAndStorage(void *pvParameters) {
         }
 
         if (settingsNeedsSaving) {
+            // Snapshot the config under the lock, then write NVS OUTSIDE it. The 24 flash writes used
+            // to hold configMutex the whole time, stalling the 20 Hz control loop (snapshotConfig()
+            // needs the same mutex every cycle). Copying the POD structs is cheap; flash is slow.
+            RuntimeConfig cfgSnap;
+            PID_Config pidSnap;
+            bool atEnabledSnap = false;
+            bool haveSnap = false;
             if (takeMutex(configMutex, pdMS_TO_TICKS(80))) {
-                prefs.putFloat("oP", cfg.offsetPIM);
-                prefs.putFloat("sP", cfg.scalePIM);
-                prefs.putFloat("pR", cfg.pulsesPerRev);
-                prefs.putFloat("oV", cfg.offsetVTA);
-                prefs.putFloat("tB", cfg.targetBoost);
-                prefs.putFloat("kP", pid.kP);
-                prefs.putFloat("kI", pid.kI);
-                prefs.putFloat("kD", pid.kD);
-                prefs.putFloat("lA", pid.learnCoeff);
-                prefs.putFloat("vP", cfg.vssPulsesPerRev);
-                prefs.putInt("tW", cfg.tireW);
-                prefs.putInt("tA", cfg.tireA);
-                prefs.putInt("tR", cfg.tireR);
-                prefs.putFloat("lB", cfg.limitBoostBar);
-                prefs.putFloat("sL", cfg.softLimpBar);
-                prefs.putFloat("hL", cfg.hardLimpBar);
-                prefs.putFloat("bH", cfg.spoolBlendHigh);
-                prefs.putFloat("bL", cfg.spoolBlendLow);
-                prefs.putFloat("fS", cfg.dutyFallSlewPerS);
-                xSemaphoreGive(configMutex);
+                cfgSnap = cfg;
+                pidSnap = pid;
+                atEnabledSnap = at.enabled;
                 settingsNeedsSaving = false;
                 forceSettingsSaveRequested = false;
+                haveSnap = true;
+                xSemaphoreGive(configMutex);
+            }
+            if (haveSnap) {
+                prefs.putFloat("oP", cfgSnap.offsetPIM);
+                prefs.putFloat("sP", cfgSnap.scalePIM);
+                prefs.putFloat("pR", cfgSnap.pulsesPerRev);
+                prefs.putFloat("oV", cfgSnap.offsetVTA);
+                prefs.putFloat("tB", cfgSnap.targetBoost);
+                prefs.putFloat("kP", pidSnap.kP);
+                prefs.putFloat("kI", pidSnap.kI);
+                prefs.putFloat("kD", pidSnap.kD);
+                prefs.putFloat("kPa", pidSnap.kPa);   // V2: auto-tuned gains, own keys
+                prefs.putFloat("kIa", pidSnap.kIa);
+                prefs.putFloat("kDa", pidSnap.kDa);
+                prefs.putBool("aT", atEnabledSnap);
+                prefs.putFloat("lA", pidSnap.learnCoeff);
+                prefs.putFloat("vP", cfgSnap.vssPulsesPerRev);
+                prefs.putInt("tW", cfgSnap.tireW);
+                prefs.putInt("tA", cfgSnap.tireA);
+                prefs.putInt("tR", cfgSnap.tireR);
+                prefs.putFloat("lB", cfgSnap.limitBoostBar);
+                prefs.putFloat("sL", cfgSnap.softLimpBar);
+                prefs.putFloat("hL", cfgSnap.hardLimpBar);
+                prefs.putFloat("bH", cfgSnap.spoolBlendHigh);
+                prefs.putFloat("bL", cfgSnap.spoolBlendLow);
+                prefs.putFloat("fS", cfgSnap.dutyFallSlewPerS);
             }
         }
 
@@ -1741,6 +2000,12 @@ void setup() {
         Serial.println("Crit Error: Mutex creation failed!");
     }
 
+    // Created before BLE init so onWrite() can enqueue from the very first client write.
+    bleCmdQueue = xQueueCreate(8, sizeof(BleCommand));
+    if (bleCmdQueue == nullptr) {
+        Serial.println("Crit Error: BLE command queue creation failed!");
+    }
+
     esp_task_wdt_config_t twdt_config = {
         .timeout_ms = WATCHDOG_TIMEOUT_SEC * 1000,
         .idle_core_mask = (1 << portNUM_PROCESSORS) - 1,
@@ -1748,6 +2013,7 @@ void setup() {
     };
     esp_task_wdt_init(&twdt_config);
 
+    Serial.println("==== FIRMWARE V2: SELF-TUNING PID (auto kPa/kIa/kDa) ====");
     Serial.println("Step: NVS init...");
     if (!prefs.begin("yrv_v4", false)) {
         Serial.println("Crit Error: NVS Init failed!");
@@ -1774,6 +2040,11 @@ void setup() {
         pid.kP = constrainFloat(prefs.getFloat("kP", DEFAULT_KP), 0.0f, 200.0f);
         pid.kI = constrainFloat(prefs.getFloat("kI", DEFAULT_KI), 0.0f, 200.0f);
         pid.kD = constrainFloat(prefs.getFloat("kD", DEFAULT_KD), 0.0f, 50.0f);
+        // V2: auto gains default to the manual gains (seeds them on a fresh V2 flash).
+        pid.kPa = constrainFloat(prefs.getFloat("kPa", pid.kP), KP_MIN, KP_MAX);
+        pid.kIa = constrainFloat(prefs.getFloat("kIa", pid.kI), KI_MIN, KI_MAX);
+        pid.kDa = constrainFloat(prefs.getFloat("kDa", pid.kD), KD_MIN, KD_MAX);
+        at.enabled = prefs.getBool("aT", AUTOTUNE_ENABLED_DEF);
         pid.learnCoeff = constrainFloat(prefs.getFloat("lA", DEFAULT_LEARN_RATE), LEARN_RATE_MIN, LEARN_RATE_MAX);
 
         if (prefs.getInt("tuneVer", 0) < 6) {
@@ -1821,6 +2092,23 @@ void setup() {
             prefs.putFloat("fS", cfg.dutyFallSlewPerS);
             prefs.putInt("tuneVer", 8);
         }
+
+        // V2 first-boot: seed the auto gains (kPa/kIa/kDa) once from the manual V1 gains so a fresh
+        // V2 flash starts exactly where V1 left off, then they self-tune from there. Separate version
+        // key (tuneVerV2) so this never touches the V1 migration chain above.
+        if (prefs.getInt("tuneVerV2", 0) < 1) {
+            pid.kPa = constrainFloat(pid.kP, KP_MIN, KP_MAX);
+            pid.kIa = constrainFloat(pid.kI, KI_MIN, KI_MAX);
+            pid.kDa = constrainFloat(pid.kD, KD_MIN, KD_MAX);
+            at.enabled = AUTOTUNE_ENABLED_DEF;
+            prefs.putFloat("kPa", pid.kPa);
+            prefs.putFloat("kIa", pid.kIa);
+            prefs.putFloat("kDa", pid.kDa);
+            prefs.putBool("aT", at.enabled);
+            prefs.putInt("tuneVerV2", 1);
+        }
+        // Last-known-good rollback target starts at the loaded auto gains.
+        at.lkgKp = pid.kPa; at.lkgKi = pid.kIa; at.lkgKd = pid.kDa;
         xSemaphoreGive(configMutex);
     }
 
@@ -1893,29 +2181,31 @@ void setup() {
     ledcWrite(solPin, 0);
 
     Serial.println("Step: BLE init...");
-    BLEDevice::init("YRV_Boost_BLE");
-    BLEDevice::setMTU(247);
-    pServer = BLEDevice::createServer();
+    NimBLEDevice::init("YRV_Boost_BLE");
+    NimBLEDevice::setMTU(247);
+    pServer = NimBLEDevice::createServer();
     pServer->setCallbacks(new MyServerCallbacks());
-    BLEService *pService = pServer->createService(SERVICE_UUID);
+    NimBLEService *pService = pServer->createService(SERVICE_UUID);
 
-    pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX, BLECharacteristic::PROPERTY_NOTIFY);
-    pTxCharacteristic->addDescriptor(new BLE2902());
+    // NimBLE auto-creates the 0x2902 CCCD for a NOTIFY characteristic — no BLE2902 to add.
+    pTxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_TX, NIMBLE_PROPERTY::NOTIFY);
 
-    BLECharacteristic *pRxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_RX, BLECharacteristic::PROPERTY_WRITE);
+    NimBLECharacteristic *pRxCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID_RX, NIMBLE_PROPERTY::WRITE);
     pRxCharacteristic->setCallbacks(new MyCallbacks());
 
     pService->start();
 
-    BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
-    pAdvertising->addServiceUUID(SERVICE_UUID);
-    pAdvertising->setScanResponse(true);
-    // Preferred connection interval hint in GAP data: 15ms–30ms
-    pAdvertising->setMinPreferred(0x0C);  // 12 * 1.25ms = 15ms
-    pAdvertising->setMaxPreferred(0x18);  // 24 * 1.25ms = 30ms
-    // Advertising interval: 20ms–40ms for fast phone discovery
-    pAdvertising->setMinInterval(32);     // 32 * 0.625ms = 20ms
-    pAdvertising->setMaxInterval(64);     // 64 * 0.625ms = 40ms
+    NimBLEAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
+    // CRITICAL: the app finds the device by NAME (Kable Filter.Name → Android ScanFilter.setDeviceName),
+    // and Android's offloaded name filter only inspects the PRIMARY advertisement, NOT the scan
+    // response. So the name MUST live in the primary packet. A 128-bit service UUID cannot share the
+    // 31-byte primary packet with the name — advertising it would push the name into the scan response,
+    // leaving the device visible to generic scanners (active scan) but INVISIBLE to the app's name
+    // filter. So advertise ONLY the name; the service is discovered after connecting (the app never
+    // filters by service UUID). On NimBLE 1.4.x use setScanResponse(true) instead of enableScanResponse().
+    pAdvertising->setName("YRV_Boost_BLE");
+    pAdvertising->enableScanResponse(true);
+    // Connection interval is negotiated actively in onConnect via updateConnParams().
     pAdvertising->start();
 
     Serial.println("Step: starting tasks...");
@@ -1924,6 +2214,7 @@ void setup() {
     xTaskCreatePinnedToCore(TaskControl, "CTRL", 4096, nullptr, 2, nullptr, 1);
     xTaskCreatePinnedToCore(TaskTelemetry, "TELEM", 4096, nullptr, 1, nullptr, 1);
     xTaskCreatePinnedToCore(TaskOdometerAndStorage, "ODO_STOR", 4096, nullptr, 1, nullptr, 0);
+    xTaskCreatePinnedToCore(TaskBleCommands, "BLECMD", 4096, nullptr, 1, nullptr, 0);
     Serial.println("Setup complete. Running.");
 }
 

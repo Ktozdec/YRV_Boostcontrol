@@ -26,7 +26,14 @@
       "Bash(awk -F, 'NR>=1139 && NR<=1162 { *)",
       "Bash(Select-String -Pattern \"^[+-]\")",
       "Bash(Select-String -Pattern \"DEFAULT_K|SPOOL_BLEND_HIGH_DEF|SPOOL_BLEND_LOW_DEF|DUTY_FALL_SLEW_DEF|tuneVer|kP|kI|kD|spoolBlend|dutyFallSlew\")",
-      "Bash(git diff *)"
+      "Bash(git diff *)",
+      "PowerShell(New-Item -ItemType Directory -Force \"firmware\\\\boost_controller_refined_v2\" | Out-Null; Copy-Item \"firmware\\\\boost_controller_refined\\\\boost_controller_refined.ino\" \"firmware\\\\boost_controller_refined_v2\\\\boost_controller_refined_v2.ino\" -Force; \\(Get-Content \"firmware\\\\boost_controller_refined_v2\\\\boost_controller_refined_v2.ino\" | Measure-Object -Line\\).Lines)",
+      "PowerShell(.\\\\gradlew.bat :app:compileDebugKotlin --console=plain 2>&1)",
+      "PowerShell($env:JAVA_HOME = \"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; .\\\\gradlew.bat :app:compileDebugKotlin --console=plain 2>&1 | Select-Object -Last 45)",
+      "PowerShell(.\\\\gradlew.bat :app:compileDebugKotlin --offline --console=plain 2>&1)",
+      "mcp__visualize__read_me",
+      "mcp__visualize__show_widget",
+      "PowerShell($c = Get-Content \"C:\\\\Users\\\\79778\\\\.claude\\\\projects\\\\C--Users-79778-Desktop-last\\\\f6d2c42e-fd1a-40da-9dba-58c8ba4e21aa\\\\tool-results\\\\toolu_01WLczUDF2mfn7enJHkCnwPF.json\" -Raw; $i = $c.IndexOf\\(\"SVG setup\"\\); $c.Substring\\($i, 2200\\))"
     ]
   }
 }

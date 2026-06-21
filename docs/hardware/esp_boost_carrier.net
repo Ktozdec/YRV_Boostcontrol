@@ -1,0 +1,157 @@
+* ============================================================================
+* ESP_Boost — carrier board (module baseboard) — SPICE netlist for EasyEDA
+* ----------------------------------------------------------------------------
+* YRV_Boostcontrol (Daihatsu YRV K3-VET) boost controller.
+* This netlist describes ONLY what the firmware actually uses, verified against
+*   firmware/boost_controller_refined/boost_controller_refined.ino   (V1)
+*   firmware/boost_controller_refined_v2/boost_controller_refined_v2.ino (V2)
+* (identical pin map in both). The MITM daughterboard from docs/hardware/
+* (GPIO4/5/26/27/32/33, relays, SN74xx, TPL5010) is NOT touched by firmware and
+* is deliberately EXCLUDED here.
+*
+* Correction vs esp_boost_board_scheme.md: that doc omits the MCP4725 DAC (boost
+* "FCD" spoof, I2C 0x60). Firmware uses it -> it is included below (U3), on the
+* same 5 V I2C bus as the ADS1115 (HV side of the level converter).
+*
+* ----------------------------------------------------------------------------
+* HOW TO IMPORT INTO EasyEDA
+*   EasyEDA Std : File > Import > Spice Netlist...   (pick this file)
+*   EasyEDA Pro : File > Import > Spice
+*   The importer creates each part + every connection (rats nest / net labels).
+*   The R / C / D / Q below come in as real components; the modules (U1..U7,
+*   J1..J5) come in as block symbols WITHOUT a PCB footprint — assign a footprint
+*   to each (headers for the modules, SOIC-8 for L9637D, screw terminals for J*),
+*   then place + route, then Fabrication Output -> Gerber. A netlist carries
+*   connectivity, not placement: the layout step is still done by you in EasyEDA.
+*
+* ----------------------------------------------------------------------------
+* BOM (carrier board)
+*   U1  ESP32 DevKit V1 (Type-C)            module, VIN = 5 V
+*   U2  ADS1115 16-bit ADC                  module, VDD = 5 V, ADDR->GND => 0x48
+*   U3  MCP4725 12-bit DAC                  module, VDD = 5 V, A0->GND   => 0x60
+*   U4  Logic level converter, 4-ch bidir   module, HV = 5 V, LV = 3V3
+*   U5  LM2596HVS buck                       module, OUT trimmed to 5.0 V
+*   U6  L9637D K-Line transceiver            SO-8 IC (+ R9/R10 + C3)
+*   U7  LR7843 MOSFET switch (opto)          module, low-side solenoid driver
+*   Q1,Q2  2N3904                            NPN, tach / VSS inverting level shift
+*   R1  1k     boost(MAP) signal -> A0 series
+*   R2  10k    TPS signal -> A1 series
+*   R3,R6  47k   base series (tach / VSS)
+*   R4,R7  10k   base pulldown (tach / VSS)
+*   R5,R8  4.7k  collector pullup to 3V3 (tach / VSS)
+*   R9  510    K-Line pullup to +12 V (VS)
+*   R10 100    K-Line series to OBD
+*   D1,D2  1N4733A  5.1 V zener clamp on A0 / A1
+*   D3  1N4007   solenoid flyback
+*   C1,C2  100nF  ADC input filter (A0 / A1)
+*   C3  100nF   L9637D VCC decoupling
+*   C4  100nF   +12 V (VS) decoupling      (optional)
+*   C5  100uF   +5 V bulk                  (optional; LM2596 module already has output cap)
+*   J1  2P  power in: +12V_IGN (after fuse/ignition), GND
+*   J2  2P  solenoid: +12V (coil high side), SOL_DRN (coil low side -> drain)
+*   J3  5P  sensor in: MAP_IN, TPS_IN, TACH_IN, VSS_IN, GND
+*   J4  2P  OBD K-Line: KLINE_OBD, GND
+*   J5  2P  boost-spoof out to ECU MAP input: DAC_OUT, GND
+*
+* ----------------------------------------------------------------------------
+* NET LEGEND
+*   P12V  switched +12 V (ignition, after fuse)      P5V  5 V (LM2596 out)
+*   P3V3  3.3 V (ESP32 on-board LDO)                 GND  common star ground
+*   SDA_LV/SCL_LV  I2C on ESP32 side (3V3, GPIO23/22)
+*   SDA_HV/SCL_HV  I2C on 5 V side (ADS1115 + MCP4725)
+*   KRX_LV  GPIO16/RX2   KTX_LV  GPIO17/TX2  (3V3 side of K-Line)
+*   KRX_HV  L9637D RX(1) KTX_HV  L9637D TX(4) (5 V side)   KBUS  L9637D K(6)
+*   ADC_A0  ADS A0 (MAP after R1+clamp)   ADC_A1  ADS A1 (TPS after R2+clamp)
+*   TACH_COLL  GPIO18 node   VSS_COLL  GPIO19 node
+*   SOL_SIG  GPIO25 -> LR7843 trigger     SOL_DRN  solenoid low side -> drain
+*   DAC_OUT  MCP4725 out -> ECU MAP input
+*
+* VERIFY BEFORE FAB (project docs are partial; confirm against your exact parts):
+*   - L9637D pin map below follows esp_boost_board_scheme.md (1=RX 3=VCC 4=TX
+*     5=GND 6=K 7=VS, pins 2/8 NC). Cross-check the datasheet of your IC.
+*   - LR7843 control-side VCC: tied to P3V3 here. Some opto variants want 5 V or
+*     have only SIG/GND on the trigger header — match your module.
+*   - LM2596HVS output MUST be trimmed to 5.0 V before powering anything.
+* ============================================================================
+
+* ---- module symbol definitions (ports only; footprints assigned in EasyEDA) --
+.subckt ESP32_DEVKIT_V1 VIN P3V3 GND IO16 IO17 IO18 IO19 IO22 IO23 IO25
+.ends
+.subckt ADS1115_MOD VDD GND SCL SDA ADDR A0 A1
+.ends
+.subckt MCP4725_MOD VDD GND SCL SDA ADDR VOUT
+.ends
+.subckt LLC_4CH HV LV GND HV1 HV2 HV3 HV4 LV1 LV2 LV3 LV4
+.ends
+.subckt LM2596HVS INP INM OUTP OUTM
+.ends
+* L9637D ports in physical pin order 1..8
+.subckt L9637D RX NC2 VCC TX GND K VS NC8
+.ends
+.subckt LR7843_MOD SIG CTRLVCC CTRLGND VLOAD DRAIN
+.ends
+.subckt CONN2 P1 P2
+.ends
+.subckt CONN5 P1 P2 P3 P4 P5
+.ends
+
+* ---- module instances --------------------------------------------------------
+* ESP32: VIN P3V3 GND IO16 IO17 IO18 IO19 IO22 IO23 IO25
+XU1 P5V P3V3 GND KRX_LV KTX_LV TACH_COLL VSS_COLL SCL_LV SDA_LV SOL_SIG ESP32_DEVKIT_V1
+* ADS1115: VDD GND SCL SDA ADDR(->0x48) A0 A1
+XU2 P5V GND SCL_HV SDA_HV GND ADC_A0 ADC_A1 ADS1115_MOD
+* MCP4725: VDD GND SCL SDA ADDR(->0x60) VOUT
+XU3 P5V GND SCL_HV SDA_HV GND DAC_OUT MCP4725_MOD
+* LLC: HV LV GND HV1 HV2 HV3 HV4 LV1 LV2 LV3 LV4
+*   ch1 = I2C SDA, ch2 = I2C SCL, ch3 = K-Line RX, ch4 = K-Line TX
+XU4 P5V P3V3 GND SDA_HV SCL_HV KRX_HV KTX_HV SDA_LV SCL_LV KRX_LV KTX_LV LLC_4CH
+* LM2596HVS: IN+ IN- OUT+ OUT-
+XU5 P12V GND P5V GND LM2596HVS
+* L9637D: RX NC2 VCC TX GND K VS NC8
+XU6 KRX_HV NC_L9_2 P5V KTX_HV GND KBUS P12V NC_L9_8 L9637D
+* LR7843: SIG CTRLVCC CTRLGND VLOAD DRAIN
+XU7 SOL_SIG P3V3 GND P12V SOL_DRN LR7843_MOD
+
+* ---- analog front-end (ADS1115 inputs) --------------------------------------
+R1 MAP_IN ADC_A0 1k
+R2 TPS_IN ADC_A1 10k
+D1 GND ADC_A0 D1N4733A
+D2 GND ADC_A1 D1N4733A
+C1 ADC_A0 GND 100n
+C2 ADC_A1 GND 100n
+
+* ---- tach (RPM) inverting level shifter -> GPIO18 ---------------------------
+R3 TACH_IN TACH_B 47k
+R4 TACH_B GND 10k
+R5 P3V3 TACH_COLL 4.7k
+Q1 TACH_COLL TACH_B GND Q2N3904
+
+* ---- VSS (speed) inverting level shifter -> GPIO19 --------------------------
+R6 VSS_IN VSS_B 47k
+R7 VSS_B GND 10k
+R8 P3V3 VSS_COLL 4.7k
+Q2 VSS_COLL VSS_B GND Q2N3904
+
+* ---- solenoid flyback (across coil; cathode to +12 V) -----------------------
+D3 SOL_DRN P12V D1N4007
+
+* ---- K-Line passive network (L9637D) ----------------------------------------
+R9 KBUS P12V 510
+R10 KBUS KLINE_OBD 100
+C3 P5V GND 100n
+C4 P12V GND 100n
+C5 P5V GND 100u
+
+* ---- connectors --------------------------------------------------------------
+XJ1 P12V GND CONN2
+XJ2 P12V SOL_DRN CONN2
+XJ3 MAP_IN TPS_IN TACH_IN VSS_IN GND CONN5
+XJ4 KLINE_OBD GND CONN2
+XJ5 DAC_OUT GND CONN2
+
+* ---- minimal device models (for clean import; not for accurate simulation) --
+.model Q2N3904 NPN(Is=6.7e-15 Bf=300 Vaf=100)
+.model D1N4733A D(Is=1e-14 Bv=5.1 Ibv=0.025)
+.model D1N4007 D(Is=1e-9 Rs=0.04 Bv=1000 Ibv=5e-6)
+
+.end

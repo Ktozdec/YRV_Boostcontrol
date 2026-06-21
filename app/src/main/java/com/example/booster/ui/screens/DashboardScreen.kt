@@ -179,6 +179,14 @@ fun DashboardScreen(viewModel: BoosterViewModel) {
             if (isTelemetryStale) {
                 StatusChip(label = "LAG", color = AccentAmber)
             }
+            // Connection status text next to the dot — so the current stage ("Поиск…", "Подключение…",
+            // "Подключено", "Обрыв…") is visible at a glance for diagnosing connection problems.
+            Text(
+                status,
+                fontSize = 11.sp,
+                fontWeight = FontWeight.Medium,
+                color = if (isConnected) StatusGreen else TextGray
+            )
             StatusDot(connected = isConnected, modifier = Modifier.size(11.dp))
         }
 
