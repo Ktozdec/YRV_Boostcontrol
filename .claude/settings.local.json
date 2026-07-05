@@ -33,7 +33,23 @@
       "PowerShell(.\\\\gradlew.bat :app:compileDebugKotlin --offline --console=plain 2>&1)",
       "mcp__visualize__read_me",
       "mcp__visualize__show_widget",
-      "PowerShell($c = Get-Content \"C:\\\\Users\\\\79778\\\\.claude\\\\projects\\\\C--Users-79778-Desktop-last\\\\f6d2c42e-fd1a-40da-9dba-58c8ba4e21aa\\\\tool-results\\\\toolu_01WLczUDF2mfn7enJHkCnwPF.json\" -Raw; $i = $c.IndexOf\\(\"SVG setup\"\\); $c.Substring\\($i, 2200\\))"
+      "PowerShell($c = Get-Content \"C:\\\\Users\\\\79778\\\\.claude\\\\projects\\\\C--Users-79778-Desktop-last\\\\f6d2c42e-fd1a-40da-9dba-58c8ba4e21aa\\\\tool-results\\\\toolu_01WLczUDF2mfn7enJHkCnwPF.json\" -Raw; $i = $c.IndexOf\\(\"SVG setup\"\\); $c.Substring\\($i, 2200\\))",
+      "Bash(ping -n 2 192.168.1.62)",
+      "Read(///192.168.1.62/addon_configs/17e0cc66_openclaw_assistant/**)",
+      "Read(///192.168.1.62/addon_configs/17e0cc66_openclaw_assistant/.local/share/gogcli/**)",
+      "Bash(node recent.mjs)",
+      "Bash(timeout 30 bash -c 'echo y | \"/c/Program Files/PuTTY/plink.exe\" -ssh -pw 190490 root@192.168.1.62 \"echo CONNECTED; python3 --version; python3 -m py_compile /config/clawd/scripts/payment-mark-paid.py && echo PYCOMPILE_OK; bash -n /config/clawd/scripts/deepseek-balance.sh && echo BASH1_OK; bash -n /config/clawd/scripts/check-payments.sh && echo BASH2_OK\" 2>&1')",
+      "Bash(ssh-keyscan -t ed25519 192.168.1.62)",
+      "Bash(ssh-keygen -lf hostkey.txt)",
+      "Bash(timeout 35 '/c/Program Files/PuTTY/plink.exe' -ssh -batch -hostkey SHA256:UNxILltT++iwjfKH+QdpeiW6YUt8QLq8s+r5eOKZEsM -pw 190490 root@192.168.1.62 'echo CONNECTED; python3 --version; python3 -m py_compile /config/clawd/scripts/payment-mark-paid.py && echo PYCOMPILE_OK; head -1 /config/clawd/scripts/deepseek-balance.sh | od -c | head -1')",
+      "Bash(echo \"[exit=$?]\")",
+      "Bash(timeout 35 '/c/Program Files/PuTTY/plink.exe' -ssh -batch -hostkey SHA256:UNxILltT++iwjfKH+QdpeiW6YUt8QLq8s+r5eOKZEsM -pw 190490 root@192.168.1.62 'ls -d /addon_configs/*openclaw* 2>/dev/null; echo '\\\\''---'\\\\''; ls /addon_configs/17e0cc66_openclaw_assistant/clawd/scripts/ 2>/dev/null')",
+      "Bash(timeout 60 '/c/Program Files/PuTTY/plink.exe' -ssh -batch -hostkey SHA256:UNxILltT++iwjfKH+QdpeiW6YUt8QLq8s+r5eOKZEsM -pw 190490 root@192.168.1.62 ' *)",
+      "Bash(timeout 40 '/c/Program Files/PuTTY/plink.exe' -ssh -batch -hostkey SHA256:UNxILltT++iwjfKH+QdpeiW6YUt8QLq8s+r5eOKZEsM -pw 190490 root@192.168.1.62 ' *)",
+      "Bash(timeout 50 '/c/Program Files/PuTTY/plink.exe' -ssh -batch -hostkey SHA256:UNxILltT++iwjfKH+QdpeiW6YUt8QLq8s+r5eOKZEsM -pw 190490 root@192.168.1.62 ' *)",
+      "Bash(grep -oiE '\\(out of extra usage|credit balance|billing[^\"]{0,40}|overage|authentication_error|invalid x-api-key|401|403|429|permission_error|disabled:billing|disabledUntil|disabledReason\\)' C:/Users/79778/.claude/projects/C--Users-79778-Desktop-last/1418b41c-76bf-48c9-9b77-b369d66153e6/tool-results/b02ukpb93.txt)",
+      "Bash(timeout 55 '/c/Program Files/PuTTY/plink.exe' -ssh -batch -hostkey SHA256:UNxILltT++iwjfKH+QdpeiW6YUt8QLq8s+r5eOKZEsM -pw 190490 root@192.168.1.62 ' *)",
+      "Bash(timeout 45 '/c/Program Files/PuTTY/plink.exe' -ssh -batch -hostkey SHA256:UNxILltT++iwjfKH+QdpeiW6YUt8QLq8s+r5eOKZEsM -pw 190490 root@192.168.1.62 ' *)"
     ]
   }
 }
