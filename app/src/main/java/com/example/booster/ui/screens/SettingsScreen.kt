@@ -85,6 +85,9 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
     var draftFs by remember { mutableFloatStateOf(0f) }
     var draftOp by remember { mutableFloatStateOf(0f) }
     var draftSp by remember { mutableFloatStateOf(0f) }
+    var draftOe by remember { mutableFloatStateOf(0f) }
+    var draftSe by remember { mutableFloatStateOf(0f) }
+    var draftSt by remember { mutableFloatStateOf(0f) }
     var draftPr by remember { mutableFloatStateOf(0f) }
     var draftOv by remember { mutableFloatStateOf(0f) }
     var draftVp by remember { mutableFloatStateOf(0f) }
@@ -110,6 +113,9 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
             draftFs = settings.dutyFallSlew
             draftOp = settings.offsetMap
             draftSp = settings.scaleMap
+            draftOe = settings.offsetEcu
+            draftSe = settings.scaleEcu
+            draftSt = settings.spoolMinTps
             draftOv = settings.offsetTps
             draftPr = settings.pulsesRpm
             draftVp = settings.vssPulses
@@ -160,8 +166,13 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
             "bH" to fmt(clampValue(draftBh, 0.05f, 1.0f), "%.2f"),
             "bL" to fmt(clampValue(draftBl, 0.0f, 0.5f), "%.2f"),
             "fS" to fmt(clampValue(draftFs, 50f, 1000f), "%.0f"),
-            "oP" to fmt(clampValue(draftOp, 0.1f, 4.5f), "%.2f"),
-            "sP" to fmt(clampValue(draftSp, 0.1f, 2.0f), "%.2f"),
+            "sT" to fmt(clampValue(draftSt, 20f, 100f), "%.0f"),
+            // Sensor calibrations go out at full precision: oP is volts (1 mV matters) and the
+            // scales carry 4 decimals (0.6588 bar/V), so "%.2f" would quantise the calibration.
+            "oP" to fmt(clampValue(draftOp, 0.1f, 4.5f), "%.3f"),
+            "sP" to fmt(clampValue(draftSp, 0.1f, 2.0f), "%.4f"),
+            "oE" to fmt(clampValue(draftOe, 0.1f, 4.5f), "%.3f"),
+            "sE" to fmt(clampValue(draftSe, 0.1f, 2.0f), "%.4f"),
             "oV" to fmt(clampValue(draftOv, 0.1f, 3.5f), "%.2f"),
             "pR" to fmt(clampValue(draftPr, 0.5f, 8.0f), "%.1f"),
             "vP" to fmt(clampValue(draftVp, 1.0f, 40.0f), "%.2f")
@@ -226,6 +237,38 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
             SettingsCard(title = "Target Boost / FCD") {
                 TuneRow("Целевой наддув (бар)", draftTb, 0.05f, "%.2f", 0.3f, 1.5f) { draftTb = it }
                 TuneRow("Лимит FCD (бар)", draftLb, 0.05f, "%.2f", 0.3f, 2.0f) { draftLb = it }
+
+                Spacer(Modifier.height(14.dp))
+                val pedalScaled = settings.pedalTargetScaling != 0
+                Text(
+                    if (pedalScaled) "Таргет от педали: ВКЛ" else "Таргет от педали: ВЫКЛ (режим AVC-R)",
+                    fontSize = 13.sp, fontWeight = FontWeight.Bold,
+                    color = if (pedalScaled) BoostBlue else AccentAmber
+                )
+                Spacer(Modifier.height(4.dp))
+                Text(
+                    if (pedalScaled)
+                        "Наддув дозируется педалью: 40% газа ≈ 0.60 от уставки, 60% ≈ 0.74, " +
+                            "полный таргет с 80%. Ход педали работает как регулятор тяги."
+                    else
+                        "Таргет всегда полный, как на AVC-R: регулятор гребёт к уставке сразу, " +
+                            "как только наддув физически возможен, независимо от хода педали.",
+                    fontSize = 12.sp, color = TextGray, letterSpacing = 0.3.sp
+                )
+                Spacer(Modifier.height(6.dp))
+                Button(
+                    onClick = { viewModel.sendCommand("SET:pT:${if (pedalScaled) 0 else 1}") },
+                    modifier = Modifier.fillMaxWidth().height(44.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = if (pedalScaled) AccentAmber.copy(alpha = 0.85f) else BoostBlue.copy(alpha = 0.85f)
+                    )
+                ) {
+                    Text(
+                        if (pedalScaled) "ПЕРЕКЛЮЧИТЬ НА AVC-R" else "ВЕРНУТЬ ТАРГЕТ ОТ ПЕДАЛИ",
+                        fontSize = 12.sp, fontWeight = FontWeight.Bold, color = NeonWhite
+                    )
+                }
             }
         }
 
@@ -233,14 +276,19 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
             SettingsCard(title = "Защита от передува (Limp)") {
                 Text(
                     "Пороги выводятся из целевого наддува автоматически и следуют за ним: " +
-                        "soft = target + 0.15, hard = target + 0.20 бар.",
+                        "soft = target + 0.15, hard = target + 0.20 бар. Считаются от УСТАВКИ, " +
+                        "а не от текущего таргета, поэтому не опускаются на частичном газе. " +
+                        "Выше soft дьюти гасится плавно (квадратично), выше hard — сразу в ноль.",
                     color = TextGray,
                     fontSize = 12.sp,
                     letterSpacing = 0.3.sp,
                     modifier = Modifier.padding(bottom = 8.dp)
                 )
-                ReadOnlyRow("Soft limp — дьюти 20% (бар)", fmt(draftTb + 0.15f, "%.2f"))
-                ReadOnlyRow("Hard limp — дьюти 0% (бар)", fmt(draftTb + 0.20f, "%.2f"))
+                // Values come from the ECU ("sL"/"hL" in the settings packet) rather than being
+                // recomputed here: the +0.15/+0.20 offsets live in the firmware, and duplicating
+                // them in the app means the screen lies the moment the firmware changes them.
+                ReadOnlyRow("Soft limp — плавный сброс дьюти (бар)", fmt(settings.softLimpBar, "%.2f"))
+                ReadOnlyRow("Hard limp — дьюти 0% (бар)", fmt(settings.hardLimpBar, "%.2f"))
             }
         }
 
@@ -276,20 +324,29 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                     }
                 }
 
-                // V2: self-tuning PID. The auto gains live in the firmware (kPa/kIa/kDa) and adapt per
-                // pull; here we just show them live and let the driver arm/disarm the tuner.
+                // The firmware keeps two sets of gains. Which one drives the loop depends on the
+                // tuner switch, so spell it out — a slider that is merely a seed looks identical
+                // to one that is live.
                 Spacer(Modifier.height(12.dp))
                 val autoOn = settings.autoTuneEnabled != 0
                 val live = liveState.value
                 Text(
-                    "Автотюн ПИД (V2): ${if (autoOn) "ВКЛ" else "ВЫКЛ"}",
+                    if (autoOn) "Автотюн ПИД: ВКЛ" else "Автотюн ПИД: ВЫКЛ",
                     fontSize = 13.sp, fontWeight = FontWeight.Bold,
                     color = if (autoOn) BoostRed else TextGray
                 )
                 Spacer(Modifier.height(4.dp))
                 Text(
-                    "Авто kP/kI/kD: ${fmt(live.autoKp, "%.1f")} / ${fmt(live.autoKi, "%.1f")} / " +
-                        "${fmt(live.autoKd, "%.1f")} · эпизодов: ${live.autoTuneEpisodes}",
+                    if (autoOn)
+                        "В моторе работают АВТО-гейны: ${fmt(live.autoKp, "%.1f")} / " +
+                            "${fmt(live.autoKi, "%.1f")} / ${fmt(live.autoKd, "%.1f")} " +
+                            "· эпизодов: ${live.autoTuneEpisodes}. Ползунки выше — стартовая точка: " +
+                            "правка любого сбрасывает тюнер на это значение."
+                    else
+                        "В моторе работают РУЧНЫЕ гейны с ползунков выше. Тюнер заморожен, " +
+                            "его последние значения: ${fmt(live.autoKp, "%.1f")} / " +
+                            "${fmt(live.autoKi, "%.1f")} / ${fmt(live.autoKd, "%.1f")} " +
+                            "· эпизодов: ${live.autoTuneEpisodes}.",
                     fontSize = 12.sp, color = TextGray
                 )
                 Spacer(Modifier.height(6.dp))
@@ -322,13 +379,54 @@ fun SettingsScreen(viewModel: BoosterViewModel) {
                 TuneRow("Полный раздув при дефиците (бар)", draftBh, 0.05f, "%.2f", 0.05f, 1.0f) { draftBh = it }
                 TuneRow("Конец раздува у таргета (бар)", draftBl, 0.01f, "%.2f", 0.0f, 0.5f) { draftBl = it }
                 TuneRow("Скорость спуска дьюти (%/с)", draftFs, 25f, "%.0f", 50f, 1000f) { draftFs = it }
+                Spacer(Modifier.height(8.dp))
+                Text(
+                    "Порог педали: ниже него раздув не включается вовсе. На частичном газе наддув " +
+                        "ограничен дросселем, а не вестгейтом — открытый дьюти там бесполезен и греет соленоид.",
+                    color = TextGray,
+                    fontSize = 12.sp,
+                    letterSpacing = 0.3.sp,
+                    modifier = Modifier.padding(bottom = 4.dp)
+                )
+                TuneRow("Порог педали для раздува (%)", draftSt, 5f, "%.0f", 20f, 100f) { draftSt = it }
+            }
+        }
+
+        item {
+            SettingsCard(title = "Сигнал на ЭБУ двигателя") {
+                val live = liveState.value
+                val ecuScale = if (draftSe > 0.0001f) draftSe else 0.55f
+                val ecuVolts = (minOf(live.boost, live.limitBoostBar) / ecuScale + draftOe)
+                    .coerceIn(0.60f, 4.60f)
+                val ecuKpa = 100f + (ecuVolts - draftOe) * ecuScale * 100f
+                Text(
+                    "Характеристика ШТАТНОГО датчика — в ней ЭБУ двигателя ждёт сигнал. " +
+                        "Не путать с калибровкой 2-барового датчика ниже: та для измерения, эта для выхода. " +
+                        "На атмосфере ЭБУ должен видеть ~100 кПа, иначе двигатель не заведётся.",
+                    color = TextGray,
+                    fontSize = 12.sp,
+                    letterSpacing = 0.3.sp,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                TuneRow("Ноль ЭБУ (oE), В", draftOe, 0.005f, "%.3f", 0.1f, 4.5f) { draftOe = it }
+                TuneRow("Множ. ЭБУ (sE), бар/В", draftSe, 0.001f, "%.4f", 0.1f, 2.0f) { draftSe = it }
+                Spacer(Modifier.height(8.dp))
+                ReadOnlyRow("Сейчас на выходе", "${fmt(ecuVolts, "%.3f")} В  ≈ ${fmt(ecuKpa, "%.0f")} кПа")
             }
         }
 
         item {
             SettingsCard(title = "Калибровки датчиков") {
-                TuneRow("Ноль MAP (oP)", draftOp, 0.01f, "%.2f", 0.1f, 4.5f) { draftOp = it }
-                TuneRow("Множ. MAP (sP)", draftSp, 0.01f, "%.2f", 0.1f, 2.0f) { draftSp = it }
+                Text(
+                    "Ноль MAP = напряжение 2-барового датчика на атмосфере, каким его видит АЦП. " +
+                        "Взять из диагностики (строка ADC ch0) при заглушенном моторе. Авто-ноль отключён.",
+                    color = TextGray,
+                    fontSize = 12.sp,
+                    letterSpacing = 0.3.sp,
+                    modifier = Modifier.padding(bottom = 8.dp)
+                )
+                TuneRow("Ноль MAP (oP), В", draftOp, 0.005f, "%.3f", 0.1f, 4.5f) { draftOp = it }
+                TuneRow("Множ. MAP (sP), бар/В", draftSp, 0.001f, "%.4f", 0.1f, 2.0f) { draftSp = it }
                 TuneRow("Ноль TPS (oV)", draftOv, 0.01f, "%.2f", 0.1f, 3.5f) { draftOv = it }
                 Spacer(Modifier.height(16.dp))
                 Text("Датчики вращения:", color = TextGray, fontSize = 12.sp, letterSpacing = 0.5.sp)

@@ -168,6 +168,7 @@ class BleManager {
                                     baseDuty = json.optDouble("bD", current.baseDuty.toDouble()).toFloat(),
                                     currentDuty = json.optDouble("cD", current.currentDuty.toDouble()).toFloat(),
                                     mode = json.optInt("mode", current.mode),
+                                    dynamicTarget = json.optDouble("tg", current.dynamicTarget.toDouble()).toFloat(),
                                     autoKp = json.optDouble("kPa", current.autoKp.toDouble()).toFloat(),
                                     autoKi = json.optDouble("kIa", current.autoKi.toDouble()).toFloat(),
                                     autoKd = json.optDouble("kDa", current.autoKd.toDouble()).toFloat(),
@@ -179,6 +180,10 @@ class BleManager {
                                 json.has("S") -> current.copy(
                                     offsetMap = json.optDouble("oP", current.offsetMap.toDouble()).toFloat(),
                                     scaleMap = json.optDouble("sP", current.scaleMap.toDouble()).toFloat(),
+                                    offsetEcu = json.optDouble("oE", current.offsetEcu.toDouble()).toFloat(),
+                                    scaleEcu = json.optDouble("sE", current.scaleEcu.toDouble()).toFloat(),
+                                    spoolMinTps = json.optDouble("sT", current.spoolMinTps.toDouble()).toFloat(),
+                                    pedalTargetScaling = json.optInt("pT", current.pedalTargetScaling),
                                     offsetTps = json.optDouble("oV", current.offsetTps.toDouble()).toFloat(),
                                     targetBoost = json.optDouble("tB", current.targetBoost.toDouble()).toFloat(),
                                     limitBoostBar = json.optDouble("lB", current.limitBoostBar.toDouble()).toFloat(),

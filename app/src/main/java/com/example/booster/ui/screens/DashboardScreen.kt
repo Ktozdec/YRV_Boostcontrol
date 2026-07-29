@@ -195,12 +195,20 @@ fun DashboardScreen(viewModel: BoosterViewModel) {
         // ── Row 2: target / FCD / current PWM ────────────────────────────────
         Row(
             modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.spacedBy(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(11.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
             InfoPair(label = "TARGET", value = String.format(Locale.US, "%.2f", data.targetBoost))
             InfoPair(label = "FCD", value = String.format(Locale.US, "%.2f", data.limitBoostBar))
             InfoPair(label = "ШИМ", value = "${data.currentDuty.toInt()}%")
+            // Which target law is live. Colour-coded because the two modes feel completely
+            // different from the driver's seat and the setting is togglable on the move.
+            val avcr = data.pedalTargetScaling == 0
+            InfoPair(
+                label = "РЕЖИМ",
+                value = if (avcr) "AVC-R" else "ПЕДАЛЬ",
+                valueColor = if (avcr) AccentAmber else BoostBlue
+            )
         }
 
         Spacer(modifier = Modifier.height(24.dp))
@@ -326,7 +334,7 @@ fun DashboardScreen(viewModel: BoosterViewModel) {
 }
 
 @Composable
-private fun InfoPair(label: String, value: String) {
+private fun InfoPair(label: String, value: String, valueColor: Color = NeonWhite.copy(alpha = 0.85f)) {
     Row(
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(4.dp)
@@ -336,14 +344,16 @@ private fun InfoPair(label: String, value: String) {
             color = TextGray,
             fontSize = 10.sp,
             fontWeight = FontWeight.Medium,
-            letterSpacing = 0.8.sp
+            letterSpacing = 0.8.sp,
+            maxLines = 1
         )
         Text(
             text = value,
-            color = NeonWhite.copy(alpha = 0.85f),
+            color = valueColor,
             fontSize = 12.sp,
             fontWeight = FontWeight.SemiBold,
-            fontFamily = FontFamily.Monospace
+            fontFamily = FontFamily.Monospace,
+            maxLines = 1
         )
     }
 }

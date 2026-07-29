@@ -27,8 +27,9 @@ private data class TripLogRow(
 
 private data class TripLogColumn(val header: String, val value: (TripLogRow) -> String)
 
-// Matches DAC_REFERENCE_VOLTAGE in boost_controller_refined.ino; caps the reconstructed МАП аут voltage.
-private const val DAC_REFERENCE_VOLTAGE = 5.02f
+// Mirrors the firmware's ECU output clamp (ECU_OUT_MIN/MAX_VOLTS in boost_controller_refined_v2.ino).
+private const val ECU_OUT_MIN_VOLTS = 0.60f
+private const val ECU_OUT_MAX_VOLTS = 4.60f
 
 class BoosterViewModel(application: Application) : AndroidViewModel(application) {
     private val bleManager = BleManager()
@@ -124,7 +125,18 @@ class BoosterViewModel(application: Application) : AndroidViewModel(application)
         TripLogColumn("Обороты") { "${it.telemetry.rpm}об/мин" },
         TripLogColumn("Скорость") { "${it.telemetry.speed}км/ч" },
         TripLogColumn("Дьюти карты") { "${fmt1(it.telemetry.baseDuty)}%" },
-        TripLogColumn("Дьюти коррекция") { "${fmt1(it.telemetry.currentDuty)}%" }
+        TripLogColumn("Дьюти коррекция") { "${fmt1(it.telemetry.currentDuty)}%" },
+        // Without these two an overshoot cannot be told apart from a target that legitimately moved,
+        // and a duty collapse cannot be told apart from a protection cut.
+        TripLogColumn("Таргет") { "${fmt2(it.telemetry.dynamicTarget)}бар" },
+        TripLogColumn("Режим") {
+            when (it.telemetry.mode) {
+                0 -> "NORMAL"
+                1 -> "SOFT_LIMP"
+                2 -> "HARD_LIMP"
+                else -> "?${it.telemetry.mode}"
+            }
+        }
     )
 
     // Streams the on-disk log to the chosen destination (no giant in-memory String).
@@ -199,17 +211,21 @@ class BoosterViewModel(application: Application) : AndroidViewModel(application)
         _diagnosticLog.value = (_diagnosticLog.value + "[$timestamp] $line").takeLast(120)
     }
 
-    // Inverse of the firmware sensor maths (boost_controller_refined.ino): the app receives the
+    // Inverse of the firmware sensor maths (boost_controller_refined_v2.ino): the app receives the
     // engineering value plus the live calibration coefficients, so the original sensor voltage can
     // be reconstructed exactly. scaleMap is guarded against a not-yet-received 0 to avoid NaN.
-    private fun mapScale(t: TelemetryData): Float = if (t.scaleMap > 0.0001f) t.scaleMap else 0.55f
+    private fun mapScale(t: TelemetryData): Float = if (t.scaleMap > 0.0001f) t.scaleMap else 0.6588f
 
     private fun mapInVolts(t: TelemetryData): Float = t.boost / mapScale(t) + t.offsetMap
 
     private fun mapOutBar(t: TelemetryData): Float = min(t.boost, t.limitBoostBar)
 
+    // The ECU output is synthesized through the STOCK sensor characteristic (oE/sE), which since the
+    // 2-bar sensor swap is a different curve from the input pair (oP/sP) used by mapInVolts above.
+    private fun ecuScale(t: TelemetryData): Float = if (t.scaleEcu > 0.0001f) t.scaleEcu else 0.55f
+
     private fun mapOutVolts(t: TelemetryData): Float =
-        (mapOutBar(t) / mapScale(t) + t.offsetMap).coerceIn(0.0f, DAC_REFERENCE_VOLTAGE)
+        (mapOutBar(t) / ecuScale(t) + t.offsetEcu).coerceIn(ECU_OUT_MIN_VOLTS, ECU_OUT_MAX_VOLTS)
 
     private fun tpsVolts(t: TelemetryData): Float {
         val span = max(0.3f, 3.71f - t.offsetTps)

@@ -49,7 +49,25 @@
       "Bash(timeout 50 '/c/Program Files/PuTTY/plink.exe' -ssh -batch -hostkey SHA256:UNxILltT++iwjfKH+QdpeiW6YUt8QLq8s+r5eOKZEsM -pw 190490 root@192.168.1.62 ' *)",
       "Bash(grep -oiE '\\(out of extra usage|credit balance|billing[^\"]{0,40}|overage|authentication_error|invalid x-api-key|401|403|429|permission_error|disabled:billing|disabledUntil|disabledReason\\)' C:/Users/79778/.claude/projects/C--Users-79778-Desktop-last/1418b41c-76bf-48c9-9b77-b369d66153e6/tool-results/b02ukpb93.txt)",
       "Bash(timeout 55 '/c/Program Files/PuTTY/plink.exe' -ssh -batch -hostkey SHA256:UNxILltT++iwjfKH+QdpeiW6YUt8QLq8s+r5eOKZEsM -pw 190490 root@192.168.1.62 ' *)",
-      "Bash(timeout 45 '/c/Program Files/PuTTY/plink.exe' -ssh -batch -hostkey SHA256:UNxILltT++iwjfKH+QdpeiW6YUt8QLq8s+r5eOKZEsM -pw 190490 root@192.168.1.62 ' *)"
+      "Bash(timeout 45 '/c/Program Files/PuTTY/plink.exe' -ssh -batch -hostkey SHA256:UNxILltT++iwjfKH+QdpeiW6YUt8QLq8s+r5eOKZEsM -pw 190490 root@192.168.1.62 ' *)",
+      "Bash(xargs wc -l)",
+      "PowerShell(arduino-cli version)",
+      "Bash(python -c \"import sys; print\\(sys.version\\)\")",
+      "Bash(python an.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python an2.py)",
+      "Bash(git rm *)",
+      "PowerShell(.\\\\gradlew.bat :app:compileDebugKotlin --console=plain -q 2>&1)",
+      "PowerShell($c=@\\(\"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\",\"C:\\\\Program Files\\\\Android\\\\Android Studio1\\\\jbr\",\"$env:LOCALAPPDATA\\\\Programs\\\\Android Studio\\\\jbr\",\"C:\\\\Program Files\\\\Java\",\"$env:LOCALAPPDATA\\\\Programs\\\\Eclipse Adoptium\"\\); foreach\\($p in $c\\){ if\\(Test-Path $p\\){ Get-ChildItem $p -ErrorAction SilentlyContinue | Select-Object -First 5 -ExpandProperty FullName; \"^^ under $p\" } })",
+      "PowerShell($env:JAVA_HOME=\"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; .\\\\gradlew.bat :app:compileDebugKotlin --console=plain 2>&1 | Select-Object -Last 45)",
+      "Bash(PYTHONIOENCODING=utf-8 python an3.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python an4.py)",
+      "PowerShell($env:JAVA_HOME=\"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; .\\\\gradlew.bat :app:compileDebugKotlin --console=plain 2>&1 | Select-Object -Last 12)",
+      "Bash(PYTHONIOENCODING=utf-8 python an5.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python an6.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python an7.py)",
+      "Bash(PYTHONIOENCODING=utf-8 python an8.py)",
+      "PowerShell($env:JAVA_HOME=\"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; .\\\\gradlew.bat :app:compileDebugKotlin --console=plain 2>&1 | Select-Object -Last 15)",
+      "PowerShell($env:JAVA_HOME=\"C:\\\\Program Files\\\\Android\\\\Android Studio\\\\jbr\"; .\\\\gradlew.bat :app:compileDebugKotlin --console=plain 2>&1 | Select-Object -Last 10)"
     ]
   }
 }

@@ -88,10 +88,33 @@ constexpr float DUTY_SLEW_PER_S = 200.0f;
 // and the downward slew (dutyFallSlewPerS) are runtime-tunable over BLE (see RuntimeConfig).
 constexpr float SPOOL_DUTY_MAX        = 95.0f;   // transient-only spool duty ceiling (NOT sustained — do not raise MAP_DUTY_MAX)
 constexpr float DUTY_RISE_SLEW_PER_S  = 800.0f;  // fast rise so spool isn't choked; the fall rate is cfg.dutyFallSlewPerS
-constexpr float SPOOL_BLEND_HIGH_DEF  = 0.15f;   // power-on default: softer handover — the latch prevents re-firing, so no need to start the assist 0.30 bar out
-constexpr float SPOOL_BLEND_LOW_DEF   = 0.03f;   // power-on default: crisp latch trip right at the target
-constexpr float DUTY_FALL_SLEW_DEF    = 150.0f;  // power-on default: downward duty slew (%/s)
+// Handover defaults, set from the 2026-07-29 road log (the first with the actuation path healthy).
+// Across all 8 assist releases the pattern was identical: the assist let go at a deficit of ~0.15
+// bar and turbo momentum then carried boost a further +0.22..+0.43 (median +0.33) — i.e. the
+// handover was happening roughly 0.2 bar too late, and every hard pull finished past the target,
+// three of them into soft/hard limp. Start fading earlier and finish while there is still headroom
+// so the carry lands ON target instead of beyond it. Deliberately not the full +0.2 correction:
+// a gentler assist spools the turbo less, so the carry shrinks too and over-correcting undershoots.
+constexpr float SPOOL_BLEND_HIGH_DEF  = 0.30f;   // deficit (bar) at which the assist is still at full duty
+constexpr float SPOOL_BLEND_LOW_DEF   = 0.10f;   // deficit (bar) at which it is fully handed to the PID
+// The old 150 %/s was provably the binding constraint on release: 21 of 32 measured fall rates sat
+// pinned at the limit while boost ran away 0.62 -> 1.01 bar in 0.4 s. The wastegate was being held
+// shut by the rate limiter, not by the controller's intent.
+constexpr float DUTY_FALL_SLEW_DEF    = 400.0f;  // power-on default: downward duty slew (%/s)
 constexpr float SPOOL_FREEZE_BLEND    = 0.05f;   // freeze the integrator while blend exceeds this (no windup on PID handover)
+// Thermal budget for the open-loop assist: 95% duty is safe only as a brief spike, never a hold.
+// A genuine spool reaches the target well inside this window; if the assist is STILL running after
+// it (target unreachable at this load, cold map, mechanical fault), latch it off so the PID alone
+// (capped at MAP_DUTY_MAX = 85%) carries the pull. Re-arms with the spool latch on pedal lift.
+constexpr uint32_t SPOOL_MAX_ASSIST_MS = 2500;
+// Pedal gate. The assist keys off the boost DEFICIT alone, which made it fire wherever boost sat
+// below target — including steady part-throttle cruise, where the throttle plate (not the wastegate)
+// is the restriction and the solenoid has no authority at all. Measured on the 2026-07-29 log:
+// 44% of an 18-minute drive ran at >=94% duty, 97% of it below 50% pedal, with one unbroken 60 s
+// stretch at 95% duty / 20% pedal / 125 km/h / -0.16 bar — i.e. the solenoid was cooked in vacuum
+// for nothing. Meanwhile real WOT (70-100% pedal) accounted for only 10% of the assist's runtime.
+// Gate it on the driver actually asking for power. Runtime-tunable over BLE (key "sT").
+constexpr float SPOOL_MIN_TPS_DEF = 50.0f;
 
 // -- Self-learning (adaptive feed-forward map) --
 constexpr float DEFAULT_LEARN_RATE  = 0.10f;   // lA: fraction of the steady integral bias baked into the map per update
@@ -128,7 +151,8 @@ constexpr float GAIN_RPM_HIGH = 6000.0f;
 // only shapes the TRANSIENT. This tuner watches each tip-in "episode", scores it (overshoot,
 // rise time, hunting, overboost) and nudges kPa/kIa/kDa by one small bounded step per episode —
 // the same converge-over-many-pulls philosophy as the map. The auto gains live in their OWN
-// NVS keys (kPa/kIa/kDa), seeded once from the manual V1 gains, so flashing V1 back is safe.
+// NVS keys (kPa/kIa/kDa), separate from the manual kP/kI/kD that seed them and that take over
+// whenever the tuner is disarmed.
 constexpr bool  AUTOTUNE_ENABLED_DEF = true;   // master switch (runtime key "aT")
 // -- Hard envelope: the tuner can never leave this box (safety) --
 constexpr float KP_MIN = 8.0f,  KP_MAX = 40.0f;
@@ -156,9 +180,38 @@ constexpr uint32_t AT_SAVE_INTERVAL_MS         = 60000;
 constexpr uint16_t AT_MIN_EPISODES_BEFORE_SAVE = 3;
 // ===============================================================================
 
-const float ATMOS_MIN_VOLTS    = 2.40f;
-const float ATMOS_MAX_VOLTS    = 2.70f;
-const float DEFAULT_OFFSET     = 2.57f;
+// ======================= MAP SENSOR / ECU PASSTHROUGH CALIBRATION =======================
+// Two INDEPENDENT characteristics. They used to be one pair, which was only correct while the
+// input sensor WAS the stock sensor. With the 2-bar sensor fitted they must be separate:
+//
+//   INPUT  (oP/sP) — the 2-bar sensor we measure and control from.
+//     Datasheet: V = 0.0964 + 0.01518 * P[kPa]   ->   P = (V - 0.0964) * 65.88
+//     scale = 65.88 kPa/V / 100 = 0.6588 bar/V. (The spec sheet's "4.65 V at 400 kPa" is a typo:
+//     4.65 V is 300 kPa, which matches both the slope and the stated 20-300 kPa range.)
+//     offset = the voltage AS READ BY THE ADS at atmosphere. Calibrated on the car 2026-07-29:
+//     1.590 V gives exactly 0.00 bar with the engine off. A multimeter against SENSOR ground reads
+//     ~17 mV higher, which is within a day's barometric drift — the grounds are effectively in
+//     agreement. Always trim oP from the ADS value (the "MAP atmosphere" line setup() prints, or
+//     the Diag "ADC ch0" line), never from a multimeter: the control loop runs on the ADS reading.
+//
+//   OUTPUT (oE/sE) — the STOCK sensor characteristic the ECU still expects. Calibrated on the car
+//     2026-07-29 against the ECU's own reported MAP: oE set so the ECU reads 99 kPa at atmosphere;
+//     sE derived from the idle-vacuum point (ECU 38 kPa at -0.635 bar). Two independent datasets
+//     both landed on ~0.53, not the stock-pair guess of 0.55.
+//     Do not "simplify" these back into one pair — the engine will not start (the ECU sees roughly
+//     half the real air charge and fuels far too lean).
+//
+//   Both pairs are per-car and per-install. These constants are only the power-on/NVS-erase
+//   defaults; the app can trim all four at runtime.
+constexpr float DEFAULT_OFFSET_PIM = 1.590f;   // ADS volts at atmosphere (2-bar sensor)
+constexpr float DEFAULT_SCALE_PIM  = 0.6588f;  // bar per volt (2-bar sensor)
+constexpr float DEFAULT_OFFSET_ECU = 2.621f;   // stock-sensor volts at atmosphere (what the ECU expects)
+constexpr float DEFAULT_SCALE_ECU  = 0.530f;   // stock-sensor bar per volt
+// Hard clamp on the synthesized ECU signal: never hand the ECU a voltage the stock sensor could not
+// physically produce, so a bad calibration cannot trip a MAP-range DTC. 0.60 V ~ full vacuum,
+// 4.60 V ~ 1.12 bar gauge — above the FCD limit, so it never interferes with normal capping.
+constexpr float ECU_OUT_MIN_VOLTS = 0.60f;
+constexpr float ECU_OUT_MAX_VOLTS = 4.60f;
 const float DAC_REFERENCE_VOLTAGE = 4.99f;   // measured VDD on the 5V rail (MCP4725 output is ratiometric to VDD)
 
 const float FILTER_NEW = 0.70f;
@@ -193,13 +246,18 @@ const int klineTxPin = 17;
 const int pwmFreq = 30;
 const int pwmRes = 8;
 volatile int testDuty = 0;
+volatile uint32_t testDutySetAtMs = 0;   // when the bench duty was last commanded (for auto-expiry)
+// Bench DUTY: override auto-expires — a slider forgotten at 80% must not silently re-engage
+// (and cook the solenoid) at the next stop. Also cleared on motion and on BLE disconnect.
+constexpr uint32_t TEST_DUTY_TIMEOUT_MS = 120000;
 
 struct PID_Config {
     float kP = DEFAULT_KP;
     float kI = DEFAULT_KI;
     float kD = DEFAULT_KD;
-    // V2: auto-tuned gains (own NVS keys kPa/kIa/kDa). The control loop runs on THESE; the manual
-    // kP/kI/kD above are kept only as the V1-compatible seed and are never written by the tuner.
+    // Auto-tuned gains (own NVS keys kPa/kIa/kDa), never written by anything but the tuner.
+    // The loop runs on these while the tuner is armed; with it disarmed the manual kP/kI/kD above
+    // take over directly. Editing a manual gain also re-seeds its auto twin ("tune from here").
     float kPa = DEFAULT_KP;
     float kIa = DEFAULT_KI;
     float kDa = DEFAULT_KD;
@@ -236,8 +294,15 @@ struct Episode {
 } ep;
 
 struct RuntimeConfig {
-    float offsetPIM = 2.56f;
-    float scalePIM = 0.55f;
+    float offsetPIM = DEFAULT_OFFSET_PIM;   // INPUT: 2-bar sensor, ADS volts at atmosphere
+    float scalePIM = DEFAULT_SCALE_PIM;     // INPUT: 2-bar sensor, bar/V
+    float offsetECU = DEFAULT_OFFSET_ECU;   // OUTPUT: stock-sensor volts at atmosphere (ECU passthrough)
+    float scaleECU = DEFAULT_SCALE_ECU;     // OUTPUT: stock-sensor bar/V
+    float spoolMinTps = SPOOL_MIN_TPS_DEF;  // pedal gate for the open-loop spool assist (%)
+    // true  = target scales with pedal (tpsTargetCurve) — pedal acts as a torque dial.
+    // false = flat AVC-R behaviour: chase the full target whenever boost is achievable at all,
+    //         regardless of how far the pedal is down. Runtime key "pT".
+    bool pedalTargetScaling = true;
     float pulsesPerRev = 2.0f;
     float offsetVTA = 0.42f;
     float targetBoost = 0.80f;
@@ -337,6 +402,11 @@ volatile bool g_ch0ok = false;     // last raw read status, channel 0 (MAP), pre
 volatile bool g_ch1ok = false;     // last raw read status, channel 1 (TPS), pre-debounce
 volatile float g_ch0v = 0.0f;      // last raw volts, channel 0 (MAP), pre-debounce
 volatile float g_ch1v = 0.0f;      // last raw volts, channel 1 (TPS), pre-debounce
+volatile float g_ecuOutVolts = 0.0f;   // last voltage synthesized for the ECU (MCP4725 target)
+// The MOMENTARY target the PID is actually chasing (user target x RPM shape x TPS scale, low-passed).
+// Telemetered because it is the one number that makes a boost log interpretable: without it an
+// overshoot cannot be told apart from a target that legitimately moved under the pedal.
+volatile float g_dynamicTarget = 0.0f;
 
 #define SERVICE_UUID           "6E400001-B5A3-F393-E0A9-E50E24DCCA9E"
 #define CHARACTERISTIC_UUID_RX "6E400002-B5A3-F393-E0A9-E50E24DCCA9E"
@@ -359,6 +429,15 @@ float targetShapeCurve[NUM_RPM_BINS] = {
     1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f, 1.00f,
     1.00f, 1.00f, 1.00f, 0.99f, 0.98f, 0.97f
 };
+
+// Target-boost multiplier vs TPS (same bins as tpsBins {10,25,40,60,80,100}): partial throttle
+// requests partial boost, so the pedal is a torque dial instead of a two-position switch. Full
+// target only near WOT. This also removes the "unreachable target" trap: at ~30% throttle the
+// engine physically cannot build the full target, which used to leave the open-loop spool assist
+// pinned at 95% duty indefinitely (solenoid overheat) and the integrator/map chasing a fiction.
+// NOTE: part-throttle map cells learned against the old full target will read high for a few
+// drives; the PID pulls them down and the learner re-converges them to the scaled targets.
+float tpsTargetCurve[NUM_TPS_BINS] = {0.35f, 0.55f, 0.75f, 0.92f, 1.00f, 1.00f};
 
 inline float constrainFloat(float x, float a, float b) {
     return x < a ? a : (x > b ? b : x);
@@ -734,6 +813,17 @@ float getTargetShape(float currentRpm) {
     return constrainFloat(targetShapeCurve[r] + ratio * (targetShapeCurve[r + 1] - targetShapeCurve[r]), 0.5f, 1.2f);
 }
 
+// 1D linear interpolation of the TPS target multiplier (see tpsTargetCurve above).
+float getTpsTargetScale(float currentTps) {
+    float rTps = constrainFloat(currentTps, tpsBins[0], tpsBins[NUM_TPS_BINS - 1]);
+    int t = 0;
+    while (t < NUM_TPS_BINS - 2 && rTps >= tpsBins[t + 1]) t++;
+    float denom = tpsBins[t + 1] - tpsBins[t];
+    if (fabs(denom) < 0.001f) denom = 0.001f;
+    float ratio = (rTps - tpsBins[t]) / denom;
+    return constrainFloat(tpsTargetCurve[t] + ratio * (tpsTargetCurve[t + 1] - tpsTargetCurve[t]), 0.2f, 1.0f);
+}
+
 // Gain scheduling: more aggressive in the spool zone, gentler up top to avoid overshoot.
 float spoolGainFactor(float currentRpm) {
     if (currentRpm <= GAIN_RPM_LOW) return GAIN_SPOOL;
@@ -924,6 +1014,21 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
     } else if (key == "sP") {
         ok = parseFloatStrict(rawValue, 0.1f, 2.0f, fValue);
         if (ok) cfg.scalePIM = fValue;
+    } else if (key == "oE") {
+        // ECU passthrough characteristic — stock-sensor volts at atmosphere.
+        ok = parseFloatStrict(rawValue, 0.1f, 4.5f, fValue);
+        if (ok) cfg.offsetECU = fValue;
+    } else if (key == "sE") {
+        // ECU passthrough characteristic — stock-sensor bar/V (never 0: used as a divisor).
+        ok = parseFloatStrict(rawValue, 0.1f, 2.0f, fValue);
+        if (ok) cfg.scaleECU = fValue;
+    } else if (key == "sT") {
+        ok = parseFloatStrict(rawValue, 20.0f, 100.0f, fValue);
+        if (ok) cfg.spoolMinTps = fValue;
+    } else if (key == "pT") {
+        // 1 = pedal-scaled target, 0 = flat full target (AVC-R style).
+        ok = parseIntStrict(rawValue, 0, 1, iValue);
+        if (ok) cfg.pedalTargetScaling = (iValue != 0);
     } else if (key == "oV") {
         ok = parseFloatStrict(rawValue, 0.1f, 3.5f, fValue);
         if (ok) cfg.offsetVTA = fValue;
@@ -936,14 +1041,28 @@ bool updateSettingValue(const String &key, const String &rawValue, String &error
     } else if (key == "kP") {
         ok = parseFloatStrict(rawValue, 0.0f, 200.0f, fValue);
         // V2: a manual edit re-seeds the auto gain ("tune from here") so the slider stays meaningful;
-        // the self-tuner then refines kPa from this point. Kept inside the envelope.
-        if (ok) { pid.kP = fValue; pid.kPa = constrainFloat(fValue, KP_MIN, KP_MAX); at.lkgKp = pid.kPa; }
+        // the self-tuner then refines kPa from this point. Re-seed ONLY on a real change — the app
+        // re-sends the unchanged slider value with every settings save, and that must not keep
+        // wiping the self-tuned kPa back to the seed.
+        if (ok) {
+            bool changed = fabsf(fValue - pid.kP) > 0.005f;
+            pid.kP = fValue;
+            if (changed) { pid.kPa = constrainFloat(fValue, KP_MIN, KP_MAX); at.lkgKp = pid.kPa; }
+        }
     } else if (key == "kI") {
         ok = parseFloatStrict(rawValue, 0.0f, 200.0f, fValue);
-        if (ok) { pid.kI = fValue; pid.kIa = constrainFloat(fValue, KI_MIN, KI_MAX); at.lkgKi = pid.kIa; }
+        if (ok) {
+            bool changed = fabsf(fValue - pid.kI) > 0.005f;
+            pid.kI = fValue;
+            if (changed) { pid.kIa = constrainFloat(fValue, KI_MIN, KI_MAX); at.lkgKi = pid.kIa; }
+        }
     } else if (key == "kD") {
         ok = parseFloatStrict(rawValue, 0.0f, 50.0f, fValue);
-        if (ok) { pid.kD = fValue; pid.kDa = constrainFloat(fValue, KD_MIN, KD_MAX); at.lkgKd = pid.kDa; }
+        if (ok) {
+            bool changed = fabsf(fValue - pid.kD) > 0.005f;
+            pid.kD = fValue;
+            if (changed) { pid.kDa = constrainFloat(fValue, KD_MIN, KD_MAX); at.lkgKd = pid.kDa; }
+        }
     } else if (key == "lA") {
         ok = parseFloatStrict(rawValue, LEARN_RATE_MIN, LEARN_RATE_MAX, fValue);
         if (ok) pid.learnCoeff = fValue;
@@ -1033,6 +1152,7 @@ class MyServerCallbacks : public NimBLEServerCallbacks {
         (void)reason;
         deviceConnected = false;
         settingsSendPending = 0;
+        testDuty = 0;   // never leave a bench test duty running with nobody connected to stop it
         NimBLEDevice::startAdvertising();
     }
 };
@@ -1068,6 +1188,7 @@ void processBleCommand(const String &msg) {
         int duty = 0;
         if (parseIntStrict(msg.substring(5), 0, 100, duty)) {
             testDuty = duty;
+            testDutySetAtMs = millis();
             sendBleAck("DUTY");
         } else {
             sendBleError("DUTY", "bad_duty");
@@ -1133,7 +1254,7 @@ void processBleCommand(const String &msg) {
             if (semi < 0) break;
             start = semi + 1;
         }
-        if (failed == 0) sendBleAck("SETALL");
+        if (failed == 0) { settingsSendPending = SETTINGS_SEND_BURST; sendBleAck("SETALL"); }
         else sendBleError("SETALL", "partial");
         return;
     }
@@ -1151,6 +1272,10 @@ void processBleCommand(const String &msg) {
 
         String error;
         if (updateSettingValue(key, val, error)) {
+            // Re-push the "S" packet so the app UI reflects the applied value. Without this a lone
+            // SET (e.g. the aT autotune toggle) changed firmware state but the app kept rendering
+            // the stale settings snapshot — the button looked dead.
+            settingsSendPending = SETTINGS_SEND_BURST;
             sendBleAck(key.c_str());
         } else {
             sendBleError(key.c_str(), error.c_str());
@@ -1358,7 +1483,9 @@ void TaskSensors(void *pvParameters) {
         // ADC debounce (F4): a single I2C glitch must not drop us into limp. Ride through
         // brief failures on the last good reading; only force a fault (0 V → limp) after
         // ADC_FAIL_LIMIT consecutive misses.
-        static float lastGoodPIM = 2.57f;   // ~atmosphere
+        // Seeded from the live calibration so a bus glitch in the first cycles rides on a real
+        // atmosphere reading, not a hard-coded value from the previous sensor.
+        static float lastGoodPIM = localCfg.offsetPIM;
         static float lastGoodVTA = 0.42f;
         static int adcFailCount = 0;
 
@@ -1383,11 +1510,16 @@ void TaskSensors(void *pvParameters) {
         g_adcFailStreak = adcFailCount;   // surfaced in the Diag line
 
         filtered_map_volts = FILTER_OLD * filtered_map_volts + FILTER_NEW * rawPIM;
+        // Read the 2-bar sensor through its OWN characteristic (oP/sP).
         float real_boost_bar = (filtered_map_volts - localCfg.offsetPIM) * localCfg.scalePIM;
 
+        // Synthesize the ECU signal through the STOCK sensor characteristic (oE/sE) — the ECU still
+        // lives in the old sensor's coordinate system and must never see the 2-bar scaling. Capped
+        // at limitBoostBar (the FCD shelf), then clamped to a physically plausible stock-sensor range.
         float ecu_boost_bar = min(real_boost_bar, localCfg.limitBoostBar);
-        float out_volts = (ecu_boost_bar / localCfg.scalePIM) + localCfg.offsetPIM;
-        out_volts = constrainFloat(out_volts, 0.0f, DAC_REFERENCE_VOLTAGE);
+        float out_volts = (ecu_boost_bar / localCfg.scaleECU) + localCfg.offsetECU;
+        out_volts = constrainFloat(out_volts, ECU_OUT_MIN_VOLTS, ECU_OUT_MAX_VOLTS);
+        g_ecuOutVolts = out_volts;   // surfaced in the Diag block for bench verification
         uint16_t dac_value = (uint16_t)((out_volts / DAC_REFERENCE_VOLTAGE) * 4095.0f);
         if (DAC_OUTPUT_ENABLED) {
             dac.setVoltage(dac_value, false);   // disable via DAC_OUTPUT_ENABLED to A/B test the bus
@@ -1450,7 +1582,7 @@ void TaskSensors(void *pvParameters) {
         if (takeMutex(dataMutex, pdMS_TO_TICKS(40))) {
             sensors.rawPIM = rawPIM;
             sensors.rawVTA = rawVTA;
-            sensors.boost = constrainFloat(real_boost_bar, -1.0f, 2.0f);
+            sensors.boost = constrainFloat(real_boost_bar, -1.0f, 2.2f);   // 2-bar sensor tops out ~1.99 bar gauge
             sensors.tps = sensors.tps * 0.60f + tpsRaw * 0.40f;
             sensors.rpm = sensors.rpm * 0.40f + medRPM * 0.60f;
             sensors.speed = smoothedSpeed;
@@ -1491,7 +1623,13 @@ void TaskControl(void *pvParameters) {
         if (dt <= 0.0002f || dt > 0.5f) dt = CONTROL_PERIOD_MS / 1000.0f;
         lastPidMicros = nowUs;
 
-        float shapedTarget = localCfg.targetBoost * getTargetShape(d.rpm);
+        // Momentary target = user target × RPM shape × TPS scale. The 0.35 s target filter below
+        // smooths pedal-driven target moves; on a fast tip-in the deficit saturates the spool blend
+        // from the first cycle anyway, so spool feel is unchanged at WOT.
+        // With pedalTargetScaling off the TPS term drops out entirely: the target is flat at the
+        // user's setting and the controller chases it whenever boost is achievable (AVC-R style).
+        float pedalScale = localCfg.pedalTargetScaling ? getTpsTargetScale(d.tps) : 1.0f;
+        float shapedTarget = localCfg.targetBoost * getTargetShape(d.rpm) * pedalScale;
         float desiredDynamicTarget = constrainFloat(shapedTarget, 0.30f, localCfg.targetBoost);
         if (!filteredDynamicTargetInitialized) {
             filteredDynamicTarget = desiredDynamicTarget;
@@ -1502,6 +1640,7 @@ void TaskControl(void *pvParameters) {
         }
 
         float dynamicTarget = filteredDynamicTarget;
+        g_dynamicTarget = dynamicTarget;
         float targetRate = (dynamicTarget - prevControlTarget) / dt;   // bar/s, smooth (target is low-passed)
         prevControlTarget = dynamicTarget;
 
@@ -1511,15 +1650,27 @@ void TaskControl(void *pvParameters) {
         // 47→95→54). spoolArmed latches OFF once boost first reaches the target band (below) and re-arms
         // on pedal lift (else branch), so a fresh throttle application / post-shift gets a full spool.
         static bool spoolArmed = true;
+        static uint32_t spoolAssistSinceMs = 0;   // start of the CONTINUOUS assist run; 0 = not assisting
 
         if (systemMode != HARD_LIMP && d.tps > 10.0f && d.rpm >= 1300.0f) {
             float err = dynamicTarget - d.boost;
 
             // Gain scheduling: aggressive on spool, gentle up top.
             float gainFactor = spoolGainFactor(d.rpm);
-            float kpEff = pid.kPa * gainFactor;                              // V2: auto-tuned base gains
-            float kiEff = pid.kIa * (1.0f + (gainFactor - 1.0f) * 0.5f);
-            float kdEff = pid.kDa;
+            // Autotune ON  -> run on the self-tuned gains; the manual kP/kI/kD act as the seed and
+            //                 the "tune from here" reset (see updateSettingValue).
+            // Autotune OFF -> run on the manual gains, so switching the tuner off actually pins the
+            //                 gains the user can see. Previously the loop kept using kPa/kIa/kDa
+            //                 whatever the switch said, so the displayed kP and the running gain
+            //                 could silently disagree. Clamped to the same safety envelope the
+            //                 tuner is held to: the manual sliders accept 0..200, which must never
+            //                 reach the loop unbounded.
+            float kpBase = at.enabled ? pid.kPa : constrainFloat(pid.kP, KP_MIN, KP_MAX);
+            float kiBase = at.enabled ? pid.kIa : constrainFloat(pid.kI, KI_MIN, KI_MAX);
+            float kdBase = at.enabled ? pid.kDa : constrainFloat(pid.kD, KD_MIN, KD_MAX);
+            float kpEff = kpBase * gainFactor;
+            float kiEff = kiBase * (1.0f + (gainFactor - 1.0f) * 0.5f);
+            float kdEff = kdBase;
 
             // F1: derivative-on-measurement evaluated over the REAL time since the boost reading
             // actually changed (the control loop runs faster than the sensor, so most cycles see
@@ -1549,8 +1700,28 @@ void TaskControl(void *pvParameters) {
             // Latch the assist off the moment boost first reaches the target band; from then on the PID
             // regulates alone for the rest of this pull (a momentary dip no longer re-slams 95% duty).
             if (spoolDeficit < localCfg.spoolBlendLow) spoolArmed = false;
-            float effSpoolBlend = spoolArmed ? spoolBlend : 0.0f;
+            // Pedal gate (see SPOOL_MIN_TPS_DEF): the assist only has authority when the driver has
+            // actually opened the throttle. At part throttle the restriction is the throttle plate,
+            // not the wastegate, so commanding 95% duty there achieves nothing and cooks the solenoid.
+            bool spoolPedalOk = d.tps >= localCfg.spoolMinTps;
+            float effSpoolBlend = (spoolArmed && spoolPedalOk) ? spoolBlend : 0.0f;
             bool spoolAssisting = effSpoolBlend > SPOOL_FREEZE_BLEND;
+
+            // Thermal budget (SPOOL_MAX_ASSIST_MS): the solenoid must never be HELD above 85%.
+            // If the assist runs continuously past the budget without the target being reached,
+            // latch it off for the rest of this pull — the PID (≤ MAP_DUTY_MAX) takes over.
+            if (spoolAssisting) {
+                uint32_t spoolNowMs = millis();
+                if (spoolAssistSinceMs == 0) {
+                    spoolAssistSinceMs = spoolNowMs;
+                } else if (spoolNowMs - spoolAssistSinceMs >= SPOOL_MAX_ASSIST_MS) {
+                    spoolArmed = false;
+                    effSpoolBlend = 0.0f;
+                    spoolAssisting = false;
+                }
+            } else {
+                spoolAssistSinceMs = 0;
+            }
 
             // Back-calculation (tracking) anti-windup. Integrate EVERY cycle — no setpoint-band gate
             // (the old INTEGRAL_BAND froze the integrator whenever |err| exceeded the band, which on a
@@ -1663,8 +1834,9 @@ void TaskControl(void *pvParameters) {
             lastMeasMicros = nowUs;
             pid.filteredDerivative = 0.0f;
             // Pedal lifted / idle: re-arm the spool latch so the next throttle application (or the
-            // next gear after a shift) gets a fresh full open-loop spool.
+            // next gear after a shift) gets a fresh full open-loop spool, with a fresh thermal budget.
             spoolArmed = true;
+            spoolAssistSinceMs = 0;
             // Hard limp or genuine idle (low TPS/RPM): solenoid fully released, wastegate open.
             // Soft limp now stays in the PID branch above and bleeds down smoothly instead.
             currentOutDuty = 0.0f;
@@ -1684,6 +1856,13 @@ void TaskControl(void *pvParameters) {
             slewLimitedDuty += constrainFloat(currentOutDuty - slewLimitedDuty, -fallStep, riseStep);
         }
         currentOutDuty = slewLimitedDuty;
+
+        // Bench test duty is self-expiring: cleared as soon as the car actually moves, and after
+        // TEST_DUTY_TIMEOUT_MS regardless (also cleared on BLE disconnect). Without this a
+        // leftover slider value re-engaged the solenoid at every stop (speed < 2).
+        if (testDuty > 0 && (d.speed >= 2.0f || millis() - testDutySetAtMs >= TEST_DUTY_TIMEOUT_MS)) {
+            testDuty = 0;
+        }
 
         // F2: write the solenoid PWM immediately here — no separate TaskPWM, no 0–20 ms dead time.
         // Manual solenoid test (DUTY:) still overrides while the car is stationary.
@@ -1744,10 +1923,13 @@ void TaskTelemetry(void *pvParameters) {
                 d.rawPIM, d.rawVTA, d.boost, d.rpm, d.tps, d.speed, g_adcFailStreak);
             // True per-channel reads (pre-debounce) + DAC state. This tells us whether MAP (ch0)
             // still reads in runtime while TPS (ch1) fails, or both die — and isolates the DAC.
-            Serial.printf("ADC ch0(MAP):%s %.3fV  ch1(TPS):%s %.3fV  DAC:%s\n",
+            // ch0 volts is the number to type into oP when the manifold is at atmosphere.
+            // ECUout is what the MCP4725 is feeding the ECU right now — check it against a
+            // multimeter on the signal wire, and against the MAP value the ECU itself reports.
+            Serial.printf("ADC ch0(MAP):%s %.3fV  ch1(TPS):%s %.3fV  DAC:%s  ECUout:%.3fV\n",
                 g_ch0ok ? "OK" : "FAIL", g_ch0v,
                 g_ch1ok ? "OK" : "FAIL", g_ch1v,
-                DAC_OUTPUT_ENABLED ? "on" : "off");
+                DAC_OUTPUT_ENABLED ? "on" : "off", g_ecuOutVolts);
             // Raw tach: periodUs = time between accepted edges; edges = running count.
             // rpm = 60e6 / periodUs / pulsesPerRev. Two prints 5 s apart → edges/5 = real edge Hz.
             Serial.printf("RPMraw periodUs:%lu edges:%lu  loopMs:%u\n",
@@ -1767,24 +1949,25 @@ void TaskTelemetry(void *pvParameters) {
                 RuntimeConfig localCfg = snapshotConfig();
 
                 snprintf(bleBuffer, sizeof(bleBuffer),
-                    "{\"S\":1,\"pR\":%.1f,\"oP\":%.2f,\"sP\":%.2f,\"oV\":%.2f,\"tB\":%.2f,\"lB\":%.2f,\"sL\":%.2f,\"hL\":%.2f,\"kP\":%.1f,\"kI\":%.1f,\"kD\":%.1f,\"tW\":%d,\"tA\":%d,\"tR\":%d,\"eH\":%.2f,\"vP\":%.2f,\"lA\":%.3f,\"bH\":%.2f,\"bL\":%.2f,\"fS\":%.0f,\"aT\":%d}\n",
-                    localCfg.pulsesPerRev, localCfg.offsetPIM, localCfg.scalePIM, localCfg.offsetVTA,
+                    "{\"S\":1,\"pR\":%.1f,\"oP\":%.3f,\"sP\":%.4f,\"oE\":%.3f,\"sE\":%.4f,\"oV\":%.2f,\"tB\":%.2f,\"lB\":%.2f,\"sL\":%.2f,\"hL\":%.2f,\"kP\":%.1f,\"kI\":%.1f,\"kD\":%.1f,\"tW\":%d,\"tA\":%d,\"tR\":%d,\"eH\":%.2f,\"vP\":%.2f,\"lA\":%.3f,\"bH\":%.2f,\"bL\":%.2f,\"fS\":%.0f,\"sT\":%.0f,\"pT\":%d,\"aT\":%d}\n",
+                    localCfg.pulsesPerRev, localCfg.offsetPIM, localCfg.scalePIM,
+                    localCfg.offsetECU, localCfg.scaleECU, localCfg.offsetVTA,
                     localCfg.targetBoost, localCfg.limitBoostBar, localCfg.softLimpBar, localCfg.hardLimpBar,
                     pid.kP, pid.kI, pid.kD,
                     localCfg.tireW, localCfg.tireA, localCfg.tireR,
                     stationaryEngineHours, localCfg.vssPulsesPerRev, pid.learnCoeff,
                     localCfg.spoolBlendHigh, localCfg.spoolBlendLow, localCfg.dutyFallSlewPerS,
-                    at.enabled ? 1 : 0
+                    localCfg.spoolMinTps, localCfg.pedalTargetScaling ? 1 : 0, at.enabled ? 1 : 0
                 );
                 sendBleText(bleBuffer);
                 settingsSendPending--;   // one packet per cycle: burst is spread across telemetry cycles, no stall
             }
 
             snprintf(bleBuffer, sizeof(bleBuffer),
-                "{\"T\":1,\"b\":%.2f,\"miB\":%.2f,\"maB\":%.2f,\"r\":%.0f,\"maR\":%.0f,\"s\":%.0f,\"maS\":%.0f,\"v\":%.0f,\"oD\":%.2f,\"bD\":%.1f,\"cD\":%.1f,\"mode\":%d,\"kPa\":%.1f,\"kIa\":%.1f,\"kDa\":%.1f,\"ate\":%u}\n",
+                "{\"T\":1,\"b\":%.2f,\"miB\":%.2f,\"maB\":%.2f,\"r\":%.0f,\"maR\":%.0f,\"s\":%.0f,\"maS\":%.0f,\"v\":%.0f,\"oD\":%.2f,\"bD\":%.1f,\"cD\":%.1f,\"mode\":%d,\"tg\":%.2f,\"kPa\":%.1f,\"kIa\":%.1f,\"kDa\":%.1f,\"ate\":%u}\n",
                 d.boost, d.minBoost, d.maxBoost, d.rpm, d.maxRPM,
                 d.speed, d.maxSpeed, d.tps, totalDistanceKm, currentBaseDuty, currentOutDuty, static_cast<int>(systemMode),
-                pid.kPa, pid.kIa, pid.kDa, at.episodes
+                g_dynamicTarget, pid.kPa, pid.kIa, pid.kDa, at.episodes
             );
             sendBleText(bleBuffer);
             lastNotifyMs = millis();
@@ -1871,6 +2054,10 @@ void TaskOdometerAndStorage(void *pvParameters) {
             if (haveSnap) {
                 prefs.putFloat("oP", cfgSnap.offsetPIM);
                 prefs.putFloat("sP", cfgSnap.scalePIM);
+                prefs.putFloat("oE", cfgSnap.offsetECU);
+                prefs.putFloat("sE", cfgSnap.scaleECU);
+                prefs.putFloat("sT", cfgSnap.spoolMinTps);
+                prefs.putBool("pT", cfgSnap.pedalTargetScaling);
                 prefs.putFloat("pR", cfgSnap.pulsesPerRev);
                 prefs.putFloat("oV", cfgSnap.offsetVTA);
                 prefs.putFloat("tB", cfgSnap.targetBoost);
@@ -2022,8 +2209,12 @@ void setup() {
     otaModeEnabled = prefs.getBool("ota_mode", false);
 
     if (takeMutex(configMutex, pdMS_TO_TICKS(100))) {
-        cfg.offsetPIM = constrainFloat(prefs.getFloat("oP", 2.56f), 0.1f, 4.5f);
-        cfg.scalePIM = constrainFloat(prefs.getFloat("sP", 0.55f), 0.1f, 2.0f);
+        cfg.offsetPIM = constrainFloat(prefs.getFloat("oP", DEFAULT_OFFSET_PIM), 0.1f, 4.5f);
+        cfg.scalePIM = constrainFloat(prefs.getFloat("sP", DEFAULT_SCALE_PIM), 0.1f, 2.0f);
+        cfg.offsetECU = constrainFloat(prefs.getFloat("oE", DEFAULT_OFFSET_ECU), 0.1f, 4.5f);
+        cfg.scaleECU = constrainFloat(prefs.getFloat("sE", DEFAULT_SCALE_ECU), 0.1f, 2.0f);
+        cfg.spoolMinTps = constrainFloat(prefs.getFloat("sT", SPOOL_MIN_TPS_DEF), 20.0f, 100.0f);
+        cfg.pedalTargetScaling = prefs.getBool("pT", true);
         cfg.pulsesPerRev = constrainFloat(prefs.getFloat("pR", 2.0f), 0.5f, 8.0f);
         cfg.offsetVTA = constrainFloat(prefs.getFloat("oV", 0.42f), 0.1f, 3.5f);
         cfg.targetBoost = constrainFloat(prefs.getFloat("tB", 0.80f), 0.3f, 1.5f);
@@ -2052,8 +2243,8 @@ void setup() {
             pid.kI = DEFAULT_KI;
             pid.kD = DEFAULT_KD;
             pid.learnCoeff = DEFAULT_LEARN_RATE;
-            cfg.offsetPIM = 2.56f;
-            cfg.scalePIM = 0.55f;
+            cfg.offsetPIM = DEFAULT_OFFSET_PIM;
+            cfg.scalePIM = DEFAULT_SCALE_PIM;
             cfg.offsetVTA = 0.42f;
             prefs.putFloat("kP", pid.kP);
             prefs.putFloat("kI", pid.kI);
@@ -2091,6 +2282,39 @@ void setup() {
             prefs.putFloat("bL", cfg.spoolBlendLow);
             prefs.putFloat("fS", cfg.dutyFallSlewPerS);
             prefs.putInt("tuneVer", 8);
+        }
+
+        // v9 migration: 2-bar MAP sensor fitted (2026-07-29). Force the new INPUT characteristic and
+        // the newly separated ECU OUTPUT characteristic over the stale single-pair NVS values — the
+        // old 2.56/0.55 applied to the new sensor reads -0.56 bar at atmosphere, feeds the ECU 45 kPa
+        // and the engine will not start. Also seeds the spool pedal gate. The learned duty map is
+        // deliberately KEPT: it maps duty vs RPM/TPS, which the sensor swap does not change.
+        if (prefs.getInt("tuneVer", 0) < 9) {
+            cfg.offsetPIM   = DEFAULT_OFFSET_PIM;
+            cfg.scalePIM    = DEFAULT_SCALE_PIM;
+            cfg.offsetECU   = DEFAULT_OFFSET_ECU;
+            cfg.scaleECU    = DEFAULT_SCALE_ECU;
+            cfg.spoolMinTps = SPOOL_MIN_TPS_DEF;
+            prefs.putFloat("oP", cfg.offsetPIM);
+            prefs.putFloat("sP", cfg.scalePIM);
+            prefs.putFloat("oE", cfg.offsetECU);
+            prefs.putFloat("sE", cfg.scaleECU);
+            prefs.putFloat("sT", cfg.spoolMinTps);
+            prefs.putInt("tuneVer", 9);
+        }
+
+        // v10 migration: new spool handover (bH 0.15->0.30, bL 0.03->0.10, fS 150->400), derived
+        // from the 2026-07-29 log — see SPOOL_BLEND_HIGH_DEF above for the measurements. Forced over
+        // stale NVS so a normal (non-erasing) flash picks them up; everything else — calibrations,
+        // odometer, engine hours, learned map — is left untouched. Still tunable from the app after.
+        if (prefs.getInt("tuneVer", 0) < 10) {
+            cfg.spoolBlendHigh   = SPOOL_BLEND_HIGH_DEF;
+            cfg.spoolBlendLow    = SPOOL_BLEND_LOW_DEF;
+            cfg.dutyFallSlewPerS = DUTY_FALL_SLEW_DEF;
+            prefs.putFloat("bH", cfg.spoolBlendHigh);
+            prefs.putFloat("bL", cfg.spoolBlendLow);
+            prefs.putFloat("fS", cfg.dutyFallSlewPerS);
+            prefs.putInt("tuneVer", 10);
         }
 
         // V2 first-boot: seed the auto gains (kPa/kIa/kDa) once from the manual V1 gains so a fresh
@@ -2142,9 +2366,12 @@ void setup() {
     Serial.println("Step: MCP4725 begin...");
     dac.begin(0x60);   // MCP4725 actual address: ADDR pad soldered to GND (A0=0 -> 0x60)
 
-    // Auto-zero the MAP at atmosphere. Uses the timeout-bounded safeReadADS1115() instead of the
-    // Adafruit blocking read, so a flaky bus can never hang setup() in an endless conversion-wait.
-    Serial.println("Step: MAP auto-zero...");
+    // MAP zero is MEASURED AND REPORTED, never auto-applied. Auto-zeroing silently rewrote the
+    // calibration from whatever pressure happened to be in the manifold at boot (mid-drive reboot,
+    // altitude, weather) and made the ECU passthrough drift with it. The reading below is printed
+    // so oP can be set deliberately from the app: with the engine off and the manifold at
+    // atmosphere, type this voltage into "Ноль MAP (oP)" and save.
+    Serial.println("Step: MAP atmosphere reading (diagnostic only, not applied)...");
     {
         float sumVolts = 0.0f;
         int validSamples = 0;
@@ -2156,14 +2383,16 @@ void setup() {
             }
             delay(5);
         }
-        float avgVolts = (validSamples > 0) ? (sumVolts / validSamples) : 0.0f;
-        if (validSamples > 0 && avgVolts >= ATMOS_MIN_VOLTS && avgVolts <= ATMOS_MAX_VOLTS) {
-            cfg.offsetPIM = avgVolts;
-            Serial.printf("Auto-Zero: offset=%.3fV (calibrated, %d samples)\n", cfg.offsetPIM, validSamples);
+        if (validSamples > 0) {
+            float avgVolts = sumVolts / validSamples;
+            // Absolute kPa straight from the 2-bar sensor datasheet, as a sanity check against the
+            // barometer: a sane atmosphere is ~95-105 kPa. Far off means wrong sensor/wiring/ground.
+            float absKpa = (avgVolts - 0.0964f) * 65.88f;
+            Serial.printf("MAP atmosphere: %.3fV (=%.1f kPa abs) | active oP=%.3fV sP=%.4f -> %.2f bar\n",
+                avgVolts, absKpa, cfg.offsetPIM, cfg.scalePIM,
+                (avgVolts - cfg.offsetPIM) * cfg.scalePIM);
         } else {
-            // Keep the NVS-loaded calibration instead of forcing a default — safe after a
-            // mid-drive reboot (not at atmosphere) or if the ADC didn't answer this boot.
-            Serial.printf("Auto-Zero: skipped (avg=%.3fV, valid=%d), keeping oP=%.3fV\n", avgVolts, validSamples, cfg.offsetPIM);
+            Serial.printf("MAP atmosphere: ADC did not answer, keeping oP=%.3fV\n", cfg.offsetPIM);
         }
         filtered_map_volts = cfg.offsetPIM;
     }
